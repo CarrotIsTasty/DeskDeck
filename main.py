@@ -967,7 +967,13 @@ class MixerTab(QWidget):
         # vertical fader; scrolls sideways if there are a lot of them.
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        # Was ScrollBarAlwaysOff - with that, resizing the window shorter
+        # than one full channel strip (name/slider/%/Mute/Hide) silently
+        # clipped the bottom of every row with no way to reach it. This
+        # makes the window height fully dynamic - resize to whatever you
+        # want, and if a row doesn't fully fit, this scrollbar appears
+        # instead of losing content.
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.container = QWidget()
         self.container_layout = QHBoxLayout(self.container)
         self.container_layout.setContentsMargins(4, 4, 4, 4)
