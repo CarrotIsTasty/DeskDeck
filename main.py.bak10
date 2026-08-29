@@ -713,15 +713,11 @@ def ensure_elevated():
 #   - This process running elevated (see ensure_elevated() above) - without
 #     that, the library loads fine but every sensor reads back as 0/empty.
 #
-# If any of the above isn't in place, get_cpu_temp()/get_ram_temp() just
-# return None (shown as "N/A"), same as before - never crashes the app.
+# If any of the above isn't in place, get_cpu_temp() just returns None
+# (shown as "N/A"), same as before - it never crashes the app.
 #
-# RAM temp uses the same LibreHardwareMonitorLib setup, via its Memory
-# hardware type. Whether it reports anything depends on the RAM itself
-# having a physical thermal sensor exposed over SPD/I2C - true for some
-# enthusiast/RGB desktop RAM kits, essentially never true for laptop RAM.
-# So on most laptops this will legitimately just stay "N/A" even with
-# everything else working correctly - that's the hardware, not a bug.
+# RAM temp still isn't covered - Windows has no built-in API for it and it's
+# not something planned to add, so get_ram_temp() stays a stub.
 #
 # GPU usage % and GPU temp DO work out of the box for NVIDIA cards via
 # `pynvml`, since NVIDIA ships that access through their driver directly -
@@ -758,7 +754,6 @@ def _init_lhm():
 
         computer = Computer()
         computer.IsCpuEnabled = True
-        computer.IsMemoryEnabled = True
         computer.Open()
     except Exception:
         return
@@ -768,24 +763,17 @@ def _init_lhm():
     _lhm_sensor_type = SensorType
 
 
-def _lhm_max_temp(hardware_type_name):
-    """Highest current temperature sensor reading among all hardware of the
-    given LibreHardwareMonitor.Hardware.HardwareType (looked up by name, e.g.
-    "Cpu" or "Memory"), in whole degrees C, or None if the DLL/pythonnet/
-    elevation aren't all in place, or that hardware has no temperature
-    sensor at all (true for most laptop RAM - see the section header above)."""
+def get_cpu_temp():
+    """Highest current CPU temperature sensor reading, in whole degrees C,
+    or None if the DLL/pythonnet/elevation aren't all in place."""
     _init_lhm()
     if _lhm_computer is None:
-        return None
-
-    target_type = getattr(_lhm_hardware_type, hardware_type_name, None)
-    if target_type is None:
         return None
 
     temps = []
     try:
         for hardware in _lhm_computer.Hardware:
-            if hardware.HardwareType != target_type:
+            if hardware.HardwareType != _lhm_hardware_type.Cpu:
                 continue
             hardware.Update()
             for sensor in hardware.Sensors:
@@ -799,10 +787,6 @@ def _lhm_max_temp(hardware_type_name):
     return int(round(max(temps)))
 
 
-def get_cpu_temp():
-    return _lhm_max_temp("Cpu")
-
-
 def get_gpu_temp():
     if NVML_AVAILABLE:
         try:
@@ -814,7 +798,7 @@ def get_gpu_temp():
 
 
 def get_ram_temp():
-    return _lhm_max_temp("Memory")
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -1154,24 +1138,11 @@ class MetricGauge(QWidget):
         self.temp_label.setStyleSheet(f"color: {TEXT_DIM}; font-size: 8.5pt; background: transparent;")
         layout.addWidget(self.temp_label)
 
-        # Optional extra line below the temp - only RAM uses this today, for
-        # a "7.4 / 16.0 GB" used/total readout. Empty and taking no visible
-        # space for CPU/GPU, which don't call set_extra_text().
-        self.extra_label = QLabel("")
-        self.extra_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.extra_label.setStyleSheet(f"color: {TEXT_DIM}; font-size: 8.5pt; background: transparent;")
-        self.extra_label.setVisible(False)
-        layout.addWidget(self.extra_label)
-
     def set_usage(self, value):
         self.gauge.setValue(value)
 
     def set_temp_text(self, text):
         self.temp_label.setText(text)
-
-    def set_extra_text(self, text):
-        self.extra_label.setText(text)
-        self.extra_label.setVisible(bool(text))
 
 
 class SystemTab(QWidget):
@@ -1215,12 +1186,7 @@ class SystemTab(QWidget):
 
     def update_stats(self):
         self.cpu_gauge.set_usage(psutil.cpu_percent())
-
-        vm = psutil.virtual_memory()
-        self.ram_gauge.set_usage(vm.percent)
-        used_gb = vm.used / (1024 ** 3)
-        total_gb = vm.total / (1024 ** 3)
-        self.ram_gauge.set_extra_text(f"{used_gb:.1f} / {total_gb:.1f} GB")
+        self.ram_gauge.set_usage(psutil.virtual_memory().percent)
 
         cpu_temp = get_cpu_temp()
         self.cpu_gauge.set_temp_text(f"{cpu_temp} °C" if cpu_temp is not None else "N/A")
