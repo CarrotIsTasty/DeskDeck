@@ -1,24 +1,31 @@
 @echo off
-echo Registering the elevated Scheduled Task for DeskDeck...
-echo.
-echo IMPORTANT: this needs to run AS ADMINISTRATOR. If you just double-clicked
-echo this file normally, close this window, then right-click
-echo setup_admin_task.bat and choose "Run as administrator" instead.
-echo.
-echo This is a ONE-TIME step. After it succeeds, launching DeskDeck will no
-echo longer show a UAC prompt every time.
-echo.
-pause
-
+setlocal enabledelayedexpansion
 cd /d "%~dp0"
 
-if exist dist\DeskDeck\DeskDeck.exe (
-    dist\DeskDeck\DeskDeck.exe --register-task
-) else if exist venv\Scripts\python.exe (
-    venv\Scripts\python.exe main.py --register-task
+:: Check for Administrator permissions
+net session >nul 2>&1
+if %errorLevel% neq 0 (
+    echo [DeskDeck] Requesting administrative privileges...
+    powershell -Command "Start-Process cmd.exe -ArgumentList '/c \"\"%~f0\"\"' -Verb RunAs"
+    exit /b
+)
+
+echo =======================================================
+echo   DeskDeck - One-Time Silent Elevation Task Setup
+echo =======================================================
+echo.
+
+if exist "%~dp0DeskDeck.exe" (
+    "%~dp0DeskDeck.exe" --register-task
+) else if exist "%~dp0dist\DeskDeck\DeskDeck.exe" (
+    "%~dp0dist\DeskDeck\DeskDeck.exe" --register-task
+) else if exist "%~dp0venv\Scripts\python.exe" (
+    "%~dp0venv\Scripts\python.exe" "%~dp0main.py" --register-task
 ) else (
-    python main.py --register-task
+    python "%~dp0main.py" --register-task
 )
 
 echo.
-pause
+echo [Done] Scheduled Task setup finished.
+echo Press any key to close this window...
+pause >nul
