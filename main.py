@@ -59,7 +59,13 @@ from PyQt6.QtGui import (
     QIcon, QPixmap
 )
 
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
+if getattr(sys, "frozen", False):
+    # Running as a PyInstaller-built .exe: use the folder the .exe lives in,
+    # not the temp extraction dir (__file__ inside a frozen bundle points
+    # into a throwaway _MEIPASS folder that vanishes after the app exits).
+    APP_DIR = os.path.dirname(os.path.abspath(sys.executable))
+else:
+    APP_DIR = os.path.dirname(os.path.abspath(__file__))
 HIDDEN_SESSIONS_FILE = os.path.join(APP_DIR, "hidden_sessions.json")
 VOLUME_PREFS_FILE = os.path.join(APP_DIR, "app_volume_prefs.json")
 
@@ -491,6 +497,8 @@ STARTUP_VALUE_NAME = "MiniControlCenter"
 
 
 def _startup_command():
+    if getattr(sys, "frozen", False):
+        return f'"{sys.executable}"'
     script_path = os.path.abspath(__file__)
     exe_dir = os.path.dirname(sys.executable)
     pythonw = os.path.join(exe_dir, "pythonw.exe")
@@ -621,6 +629,8 @@ def is_admin():
 
 
 def _elevated_task_command():
+    if getattr(sys, "frozen", False):
+        return f'"{sys.executable}"'
     script = os.path.abspath(__file__)
     exe_dir = os.path.dirname(sys.executable)
     pythonw = os.path.join(exe_dir, "pythonw.exe")
@@ -689,8 +699,11 @@ def ensure_elevated():
         pass
 
     try:
-        script = os.path.abspath(__file__)
-        params = " ".join(f'"{a}"' for a in ([script] + sys.argv[1:]))
+        if getattr(sys, "frozen", False):
+            args = sys.argv[1:]
+        else:
+            args = [os.path.abspath(__file__)] + sys.argv[1:]
+        params = " ".join(f'"{a}"' for a in args)
         result = ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, params, None, 1)
         if result > 32:
             # Elevated relaunch was accepted and started - let that copy be

@@ -24,3 +24,9 @@ app_state.json
 hidden_sessions.json
 app_volume_prefs.json
 window_state.json
+
+# PyInstaller build output - regenerate with build.bat, don't commit ~300MB
+# of bundled Qt/Python runtime binaries
+build/
+dist/
+*.spec
