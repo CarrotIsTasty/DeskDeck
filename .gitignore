@@ -1,0 +1,26 @@
+# Python virtual environment - regenerate with:
+#   python -m venv venv && venv\Scripts\activate && pip install -r requirements.txt
+venv/
+
+# Python bytecode cache - regenerates automatically
+__pycache__/
+*.pyc
+
+# Manual backup snapshots from iterative development - superseded by git history
+*.bak
+main.py.bak*
+
+# LibreHardwareMonitor's full extracted release download - only
+# LibreHardwareMonitorLib.dll (+ companion DLLs) in libs/ is actually needed
+LibreHardwareMonitor/
+
+# Scratch folder for files pending manual deletion
+_to_delete/
+
+# Runtime/user-specific state, not source - regenerates on first run and
+# differs per machine (window position, hidden Discord sessions, saved
+# per-app volume levels)
+app_state.json
+hidden_sessions.json
+app_volume_prefs.json
+window_state.json
