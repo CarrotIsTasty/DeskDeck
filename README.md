@@ -4,7 +4,7 @@ A Windows-only desktop app (PyQt6), single window, dark "mixer console" look. Ev
 
 - **App volume mixer**, styled like a DJ mixer — every app currently playing audio gets its own vertical fader (push up for louder) plus mute/hide (WASAPI via `pycaw`). Apps you don't care about can be hidden with the **Hide** button. Hidden state persists across restarts (`hidden_sessions.json`). For most apps this is matched by `GetSessionInstanceIdentifier()`, unique per session instance — hiding one process doesn't hide all of an app's processes. For apps like Discord that run several identically-named processes with genuinely different *roles* (its main app process vs. a separate audio-service process specifically for voice calls), `_stable_role_key()` upgrades the match to those processes' `--type=`/`--utility-sub-type=` command-line flags instead, which stay the same across restarts — so e.g. hiding just Discord's system-sound session (and keeping its voice-call session visible) now survives a reboot instead of both reappearing. Check **Show hidden** to reveal and unhide entries later.
 - **Per-app volume persistence** (`app_volume_prefs.json`, keyed by executable name) — the level you leave an app's fader at is restored automatically the next time that app plays audio, including after restarting Mini Control Center. It's applied once per session instance, so it won't fight you if you then change the level again by hand.
-- **CPU / RAM / GPU gauges** — speedometer-style dials with usage % centered, the label underneath, and temperature under that where available. RAM's gauge also shows used/total GB (e.g. "7.4 / 16.0 GB").
+- **CPU / RAM / GPU gauges** — speedometer-style dials with usage % centered, the label underneath, and temperature under that where available. CPU and GPU also show their model name (e.g. "Ryzen 5 5600H") in small text under the label — hover if it's truncated to see the full name. RAM's gauge also shows used/total GB (e.g. "7.4 / 16.0 GB").
 - **System tray** — closing the window tucks the app into the tray instead of quitting (mixer + gauges keep running); right-click the tray icon for Show / Quit, or double-click it to bring the window back.
 - **Start with Windows** — a checkbox next to the title writes/removes a `HKCU\...\Run` registry entry, no admin rights needed.
 - **Always on top** — a checkbox next to the title pins the window above all others, like PowerToys' Always on Top.
@@ -78,6 +78,8 @@ main.py
 │   in-process via pythonnet (libs/); get_cpu_temp/get_ram_temp report the highest current
 │   temperature sensor for the Cpu/Memory hardware type respectively (RAM likely N/A - see README)
 ├── get_gpu_temp — GPU via pynvml (NVIDIA only)
+├── get_cpu_name / get_gpu_name — model name shown under each gauge label; CPU from the registry
+│   (no dependency on the LHM setup above), GPU via pynvml (NVIDIA only, blank otherwise)
 ├── AppVolumeRow — one vertical-fader channel strip per audio-producing app
 ├── MixerTab — horizontally scrolling row of channel strips, auto-refreshing, with volume-pref persistence
 ├── GaugeWidget / MetricGauge — speedometer-style dial + label + temp

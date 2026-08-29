@@ -818,6 +818,54 @@ def get_ram_temp():
 
 
 # ---------------------------------------------------------------------------
+# CPU / GPU model name - cosmetic only, shown under the gauge labels.
+#
+# CPU name comes straight from the registry (ProcessorNameString), which
+# Windows always has available with no admin rights and no dependency on the
+# LibreHardwareMonitorLib/pythonnet setup above - so it works even if that
+# setup is missing or CPU temp is showing "N/A".
+#
+# GPU name uses the same pynvml already in use for GPU usage/temp, so it has
+# the same NVIDIA-only limitation - stays blank (name just isn't shown) for
+# AMD/Intel GPUs.
+#
+# Both are looked up once and cached, since a model name doesn't change
+# during a run.
+# ---------------------------------------------------------------------------
+
+_cpu_name_cache = None
+_gpu_name_cache = None
+
+
+def get_cpu_name():
+    global _cpu_name_cache
+    if _cpu_name_cache is not None:
+        return _cpu_name_cache
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"HARDWARE\DESCRIPTION\System\CentralProcessor\0") as key:
+            name, _ = winreg.QueryValueEx(key, "ProcessorNameString")
+            _cpu_name_cache = name.strip()
+    except Exception:
+        _cpu_name_cache = ""
+    return _cpu_name_cache
+
+
+def get_gpu_name():
+    global _gpu_name_cache
+    if _gpu_name_cache is not None:
+        return _gpu_name_cache
+    _gpu_name_cache = ""
+    if NVML_AVAILABLE:
+        try:
+            handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            raw = pynvml.nvmlDeviceGetName(handle)
+            _gpu_name_cache = raw.decode() if isinstance(raw, bytes) else raw
+        except Exception:
+            pass
+    return _gpu_name_cache
+
+
+# ---------------------------------------------------------------------------
 # UI: single app volume channel strip
 # ---------------------------------------------------------------------------
 
@@ -1155,6 +1203,15 @@ class MetricGauge(QWidget):
         name_label.setStyleSheet(f"color: {TEXT}; background: transparent;")
         layout.addWidget(name_label)
 
+        # Model name (e.g. "Ryzen 5 5600H") - set once via set_detail_text(),
+        # not on every poll, since it doesn't change during a run. Elided to
+        # fit the card, with the full name always available as a tooltip.
+        self.detail_label = QLabel("")
+        self.detail_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.detail_label.setStyleSheet(f"color: {TEXT_DIM}; font-size: 7.5pt; background: transparent;")
+        self.detail_label.setVisible(False)
+        layout.addWidget(self.detail_label)
+
         self.temp_label = QLabel("-- °C")
         self.temp_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.temp_label.setStyleSheet(f"color: {TEXT_DIM}; font-size: 8.5pt; background: transparent;")
@@ -1171,6 +1228,16 @@ class MetricGauge(QWidget):
 
     def set_usage(self, value):
         self.gauge.setValue(value)
+
+    def set_detail_text(self, text):
+        if not text:
+            self.detail_label.setVisible(False)
+            return
+        self.detail_label.setToolTip(text)
+        metrics = QFontMetrics(self.detail_label.font())
+        elided = metrics.elidedText(text, Qt.TextElideMode.ElideRight, 150)
+        self.detail_label.setText(elided)
+        self.detail_label.setVisible(True)
 
     def set_temp_text(self, text):
         self.temp_label.setText(text)
@@ -1200,6 +1267,9 @@ class SystemTab(QWidget):
         gauges_row.addWidget(self.ram_gauge)
         gauges_row.addWidget(self.gpu_gauge)
         outer.addLayout(gauges_row)
+
+        self.cpu_gauge.set_detail_text(get_cpu_name())
+        self.gpu_gauge.set_detail_text(get_gpu_name())
 
         if not NVML_AVAILABLE:
             warn = QLabel("GPU usage unavailable (install pynvml for NVIDIA GPUs)")
