@@ -51,7 +51,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QSlider, QPushButton, QScrollArea, QFrame, QTabWidget,
     QProgressBar, QCheckBox, QGraphicsDropShadowEffect, QSizePolicy,
-    QSystemTrayIcon, QMenu
+    QSystemTrayIcon, QMenu, QMessageBox
 )
 from PyQt6.QtCore import Qt, QTimer, QRectF
 from PyQt6.QtGui import (
@@ -677,6 +677,60 @@ def register_elevated_task():
         print(result.stdout)
         print(result.stderr)
     return result.returncode == 0
+
+
+def launch_elevated_registration():
+    """Relaunches this app elevated just long enough to run
+    register_elevated_task() - the in-app equivalent of right-clicking
+    setup_admin_task.bat -> Run as administrator, for people who'd rather
+    not go hunting for a .bat file. Shows exactly one UAC prompt (Windows
+    requires that one-time trust decision for any elevated action - no way
+    around it), blocks until the elevated helper exits (it only calls
+    schtasks, so this is near-instant), and returns whether the task ended
+    up registered - False if the prompt was declined or something failed.
+    """
+    if getattr(sys, "frozen", False):
+        exe = sys.executable
+        params = "--register-task"
+    else:
+        exe_dir = os.path.dirname(sys.executable)
+        pythonw = os.path.join(exe_dir, "pythonw.exe")
+        exe = pythonw if os.path.exists(pythonw) else sys.executable
+        params = f'"{os.path.abspath(__file__)}" --register-task'
+
+    class SHELLEXECUTEINFOW(ctypes.Structure):
+        _fields_ = [
+            ("cbSize", ctypes.c_ulong), ("fMask", ctypes.c_ulong),
+            ("hwnd", ctypes.c_void_p), ("lpVerb", ctypes.c_wchar_p),
+            ("lpFile", ctypes.c_wchar_p), ("lpParameters", ctypes.c_wchar_p),
+            ("lpDirectory", ctypes.c_wchar_p), ("nShow", ctypes.c_int),
+            ("hInstApp", ctypes.c_void_p), ("lpIDList", ctypes.c_void_p),
+            ("lpClass", ctypes.c_wchar_p), ("hKeyClass", ctypes.c_void_p),
+            ("dwHotKey", ctypes.c_ulong), ("hIcon", ctypes.c_void_p),
+            ("hProcess", ctypes.c_void_p),
+        ]
+
+    SEE_MASK_NOCLOSEPROCESS = 0x00000040
+    SW_HIDE = 0
+
+    info = SHELLEXECUTEINFOW()
+    info.cbSize = ctypes.sizeof(SHELLEXECUTEINFOW)
+    info.fMask = SEE_MASK_NOCLOSEPROCESS
+    info.lpVerb = "runas"
+    info.lpFile = exe
+    info.lpParameters = params
+    info.nShow = SW_HIDE
+
+    try:
+        if not ctypes.windll.shell32.ShellExecuteExW(ctypes.byref(info)):
+            return False  # declined the UAC prompt, or failed outright
+        if info.hProcess:
+            ctypes.windll.kernel32.WaitForSingleObject(info.hProcess, 15000)
+            ctypes.windll.kernel32.CloseHandle(info.hProcess)
+    except Exception:
+        return False
+
+    return elevated_task_exists()
 
 
 def ensure_elevated():
@@ -1405,6 +1459,20 @@ class ControlCenter(QMainWindow):
         self.startup_checkbox.stateChanged.connect(self.toggle_startup)
         subtitle_row.addWidget(self.startup_checkbox)
 
+        # One-time setup so startup (and every other launch) doesn't show a
+        # UAC prompt, and CPU temp works - the in-app alternative to
+        # right-clicking setup_admin_task.bat -> Run as administrator.
+        # Hidden once that's already been done (elevated_task_exists()).
+        self.enable_silent_startup_button = QPushButton("Enable silent startup")
+        self.enable_silent_startup_button.setToolTip(
+            "One-time setup (needs a single admin approval) so DeskDeck never "
+            "shows a Windows permission prompt again, and CPU temperature works"
+        )
+        self.enable_silent_startup_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.enable_silent_startup_button.setVisible(not elevated_task_exists())
+        self.enable_silent_startup_button.clicked.connect(self.enable_silent_startup)
+        subtitle_row.addWidget(self.enable_silent_startup_button)
+
         title_box.addWidget(title)
         title_box.addLayout(subtitle_row)
         layout.addLayout(title_box)
@@ -1434,6 +1502,31 @@ class ControlCenter(QMainWindow):
 
     def toggle_startup(self, state):
         set_startup_enabled(bool(state))
+
+    def enable_silent_startup(self):
+        reply = QMessageBox.question(
+            self, "Enable silent startup",
+            "Windows will ask you to approve this once (an admin permission "
+            "prompt).\n\nAfter that, DeskDeck can start with no prompts at "
+            "all, and CPU temperature readings will work.\n\nContinue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        if launch_elevated_registration():
+            self.enable_silent_startup_button.setVisible(False)
+            QMessageBox.information(
+                self, "Done",
+                "Silent startup is enabled. You can now check "
+                "'Start with Windows' with no more prompts.",
+            )
+        else:
+            QMessageBox.warning(
+                self, "Not enabled",
+                "That wasn't approved, so nothing changed. You can try "
+                "again anytime - DeskDeck works fine without it, just with "
+                "an admin prompt on each launch and no CPU temperature.",
+            )
 
     def toggle_always_on_top(self, state):
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, bool(state))
