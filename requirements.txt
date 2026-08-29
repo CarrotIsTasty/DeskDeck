@@ -1,0 +1,6 @@
+PyQt6
+pycaw
+comtypes
+psutil
+pynvml
+pythonnet

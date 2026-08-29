@@ -1,0 +1,482 @@
+"""
+Mini Control Center
+--------------------
+A prototype Windows control panel that lets you:
+  - See every app currently playing audio and control its volume/mute individually
+  - Watch live CPU usage + temp, RAM usage, and GPU usage + temp
+
+WINDOWS ONLY. Relies on:
+  - WASAPI (via pycaw/comtypes) for per-app audio
+  - psutil for CPU/RAM usage
+  - pynvml for GPU usage/VRAM (NVIDIA only)
+  - LibreHardwareMonitor's WMI interface for CPU temp + GPU temp (any vendor)
+
+Install dependencies:
+    pip install PyQt6 pycaw comtypes psutil pynvml wmi
+
+Also required for temps:
+    Download LibreHardwareMonitor (https://github.com/LibreHardwareMonitor/LibreHardwareMonitor),
+    run LibreHardwareMonitor.exe AS ADMINISTRATOR, and leave it running in the background.
+    It exposes a WMI namespace (root\\LibreHardwareMonitor) that this app reads from.
+    If it's not running, CPU/GPU temp will just show "N/A".
+
+Run:
+    python main.py
+"""
+
+import sys
+import os
+import json
+import psutil
+
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QLabel, QSlider, QPushButton, QScrollArea, QFrame, QTabWidget,
+    QProgressBar, QCheckBox
+)
+from PyQt6.QtCore import Qt, QTimer, QRectF
+from PyQt6.QtGui import QPainter, QPen, QColor, QFont
+
+HIDDEN_SESSIONS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hidden_sessions.json")
+
+from pycaw.pycaw import AudioUtilities
+
+try:
+    import pynvml
+    pynvml.nvmlInit()
+    NVML_AVAILABLE = True
+except Exception:
+    NVML_AVAILABLE = False
+
+
+# ---------------------------------------------------------------------------
+# Audio helpers
+# ---------------------------------------------------------------------------
+
+def get_playback_sessions():
+    """Return list of (display_name, pid, identifier, SimpleAudioVolume interface)
+    for every app currently holding an audio session.
+
+    `identifier` uses IAudioSessionControl2.GetSessionInstanceIdentifier(), which
+    WASAPI guarantees is unique PER SESSION INSTANCE. This matters for apps like
+    Discord: its multiple subprocesses share the same GetSessionIdentifier()
+    (that one is meant for grouping sessions from the same app, e.g. so a volume
+    change applies to "the app" as a whole) - using that for hiding caused hiding
+    one Discord process to hide all of them. GetSessionInstanceIdentifier() does
+    not have this problem, at the cost of not being guaranteed stable across a
+    full app restart (usually it still is in practice, but if a hidden entry
+    reappears after relaunching the app, just hide it again).
+    """
+    sessions = AudioUtilities.GetAllSessions()
+    result = []
+    for session in sessions:
+        if session.Process is None:
+            continue  # system sounds session with no owning process; skip
+        try:
+            name = session.Process.name()
+            pid = session.Process.pid
+            volume_iface = session.SimpleAudioVolume
+            try:
+                identifier = session._ctl.GetSessionInstanceIdentifier()
+            except Exception:
+                identifier = f"{name}:{pid}"  # fallback: unique for this run only
+            result.append((name, pid, identifier, volume_iface))
+        except Exception:
+            continue
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Hidden-session persistence
+# ---------------------------------------------------------------------------
+
+def load_hidden_identifiers():
+    if not os.path.exists(HIDDEN_SESSIONS_FILE):
+        return set()
+    try:
+        with open(HIDDEN_SESSIONS_FILE, "r") as f:
+            return set(json.load(f))
+    except Exception:
+        return set()
+
+
+def save_hidden_identifiers(identifiers):
+    try:
+        with open(HIDDEN_SESSIONS_FILE, "w") as f:
+            json.dump(sorted(identifiers), f, indent=2)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Hardware sensor helpers - NO external app or driver required.
+#
+# CPU temp and RAM temp aren't exposed by any built-in Windows API, so without
+# extra software (LibreHardwareMonitor, OpenHardwareMonitor, etc.) there's no
+# reliable, vendor-agnostic way to read them. Both simply return None here,
+# which the UI shows as "N/A".
+#
+# GPU usage % and GPU temp DO work out of the box for NVIDIA cards via
+# `pynvml`, since NVIDIA ships that access through their driver directly -
+# no separate monitoring app needed for that one.
+# ---------------------------------------------------------------------------
+
+def get_cpu_temp():
+    return None
+
+
+def get_gpu_temp():
+    if NVML_AVAILABLE:
+        try:
+            handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            return pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU)
+        except Exception:
+            pass
+    return None
+
+
+def get_ram_temp():
+    return None
+
+
+# ---------------------------------------------------------------------------
+# UI: single app volume row
+# ---------------------------------------------------------------------------
+
+class AppVolumeRow(QFrame):
+    def __init__(self, name, pid, identifier, volume_iface, on_hide=None):
+        super().__init__()
+        self.pid = pid
+        self.identifier = identifier
+        self.volume_iface = volume_iface
+        self.on_hide = on_hide
+
+        layout = QHBoxLayout(self)
+
+        label = QLabel(f"{name}  (PID {pid})")
+        label.setMinimumWidth(220)
+        layout.addWidget(label)
+
+        self.mute_btn = QPushButton()
+        self.mute_btn.setFixedWidth(70)
+        self.mute_btn.clicked.connect(self.toggle_mute)
+        layout.addWidget(self.mute_btn)
+
+        hide_btn = QPushButton("Hide")
+        hide_btn.setFixedWidth(50)
+        hide_btn.setToolTip("Hide this entry permanently (e.g. a duplicate Discord process)")
+        hide_btn.clicked.connect(self.hide_session)
+        layout.addWidget(hide_btn)
+
+        self.slider = QSlider(Qt.Orientation.Horizontal)
+        self.slider.setRange(0, 100)
+        try:
+            current = volume_iface.GetMasterVolume()
+            self.slider.setValue(int(current * 100))
+        except Exception:
+            self.slider.setValue(100)
+        self.slider.valueChanged.connect(self.set_volume)
+        layout.addWidget(self.slider)
+
+        self.pct_label = QLabel(f"{self.slider.value()}%")
+        self.pct_label.setFixedWidth(40)
+        layout.addWidget(self.pct_label)
+
+        self.refresh_mute_label()
+
+    def set_volume(self, value):
+        try:
+            self.volume_iface.SetMasterVolume(value / 100.0, None)
+            self.pct_label.setText(f"{value}%")
+        except Exception:
+            pass
+
+    def toggle_mute(self):
+        try:
+            muted = bool(self.volume_iface.GetMute())
+            self.volume_iface.SetMute(0 if muted else 1, None)
+            self.refresh_mute_label()
+        except Exception:
+            pass
+
+    def refresh_mute_label(self):
+        try:
+            muted = bool(self.volume_iface.GetMute())
+        except Exception:
+            muted = False
+        self.mute_btn.setText("Unmute" if muted else "Mute")
+
+    def hide_session(self):
+        if self.on_hide:
+            self.on_hide(self.identifier)
+
+
+# ---------------------------------------------------------------------------
+# UI: Mixer tab
+# ---------------------------------------------------------------------------
+
+class MixerTab(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.hidden_identifiers = load_hidden_identifiers()
+        self.show_hidden = False
+
+        outer = QVBoxLayout(self)
+
+        header = QHBoxLayout()
+        header.addWidget(QLabel("<b>App Volume Mixer</b>"))
+        header.addStretch()
+
+        self.show_hidden_checkbox = QCheckBox("Show hidden")
+        self.show_hidden_checkbox.setToolTip("Reveal hidden entries so you can unhide them")
+        self.show_hidden_checkbox.stateChanged.connect(self.toggle_show_hidden)
+        header.addWidget(self.show_hidden_checkbox)
+
+        refresh_btn = QPushButton("Refresh")
+        refresh_btn.clicked.connect(self.rebuild_rows)
+        header.addWidget(refresh_btn)
+        outer.addLayout(header)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        self.container = QWidget()
+        self.container_layout = QVBoxLayout(self.container)
+        self.container_layout.addStretch()
+        scroll.setWidget(self.container)
+        outer.addWidget(scroll)
+
+        self.rebuild_rows()
+
+        # periodic refresh so newly-opened apps show up automatically
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.rebuild_rows)
+        self.timer.start(4000)
+
+    def toggle_show_hidden(self, state):
+        self.show_hidden = bool(state)
+        self.rebuild_rows()
+
+    def hide_identifier(self, identifier):
+        self.hidden_identifiers.add(identifier)
+        save_hidden_identifiers(self.hidden_identifiers)
+        self.rebuild_rows()
+
+    def unhide_identifier(self, identifier):
+        self.hidden_identifiers.discard(identifier)
+        save_hidden_identifiers(self.hidden_identifiers)
+        self.rebuild_rows()
+
+    def rebuild_rows(self):
+        # clear existing rows
+        while self.container_layout.count() > 1:
+            item = self.container_layout.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+
+        sessions = get_playback_sessions()
+
+        if not self.show_hidden:
+            sessions = [s for s in sessions if s[2] not in self.hidden_identifiers]
+
+        if not sessions:
+            msg = "No apps are currently playing audio." if not self.hidden_identifiers else \
+                  "No visible apps. Check 'Show hidden' if you hid something by mistake."
+            empty = QLabel(msg)
+            self.container_layout.insertWidget(0, empty)
+            return
+
+        for name, pid, identifier, iface in sessions:
+            if self.show_hidden and identifier in self.hidden_identifiers:
+                row = AppVolumeRow(name, pid, identifier, iface, on_hide=self.unhide_identifier)
+                # relabel the hide button to "Unhide" for already-hidden rows
+                for btn in row.findChildren(QPushButton):
+                    if btn.text() == "Hide":
+                        btn.setText("Unhide")
+            else:
+                row = AppVolumeRow(name, pid, identifier, iface, on_hide=self.hide_identifier)
+            self.container_layout.insertWidget(self.container_layout.count() - 1, row)
+
+
+# ---------------------------------------------------------------------------
+# UI: System monitor tab
+# ---------------------------------------------------------------------------
+
+class GaugeWidget(QWidget):
+    """A speedometer-style circular gauge. Draws a 270-degree arc track with a
+    colored fill proportional to `value`, and the percentage centered inside."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.value = 0.0
+        self.setMinimumSize(130, 130)
+
+    def setValue(self, value):
+        self.value = max(0.0, min(100.0, value))
+        self.update()
+
+    def _color_for_ratio(self, ratio):
+        if ratio < 0.6:
+            return QColor(76, 175, 80)    # green
+        elif ratio < 0.85:
+            return QColor(255, 193, 7)    # amber
+        return QColor(244, 67, 54)        # red
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        side = min(self.width(), self.height())
+        thickness = max(8, int(side * 0.09))
+        margin = thickness + 4
+        rect = QRectF(
+            (self.width() - side) / 2 + margin / 2,
+            (self.height() - side) / 2 + margin / 2,
+            side - margin,
+            side - margin,
+        )
+
+        start_angle = 225   # bottom-left, in Qt's counterclockwise-from-3-o'clock system
+        total_span = -270   # sweep clockwise over the top to bottom-right
+
+        # background track
+        pen_bg = QPen(QColor(70, 70, 70), thickness, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
+        painter.setPen(pen_bg)
+        painter.drawArc(rect, start_angle * 16, total_span * 16)
+
+        # filled portion
+        ratio = self.value / 100.0
+        pen_fg = QPen(self._color_for_ratio(ratio), thickness, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
+        painter.setPen(pen_fg)
+        painter.drawArc(rect, start_angle * 16, int(total_span * ratio * 16))
+
+        # percentage text, centered
+        painter.setPen(QColor(235, 235, 235))
+        font = QFont()
+        font.setPointSize(max(10, int(side * 0.15)))
+        font.setBold(True)
+        painter.setFont(font)
+        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, f"{int(round(self.value))}%")
+
+
+class MetricGauge(QWidget):
+    """Gauge + label + temperature, stacked: [gauge with % in the middle] / [CPU|RAM|GPU] / [temp]."""
+
+    def __init__(self, name):
+        super().__init__()
+        layout = QVBoxLayout(self)
+        layout.setSpacing(2)
+
+        self.gauge = GaugeWidget()
+        layout.addWidget(self.gauge, alignment=Qt.AlignmentFlag.AlignCenter)
+
+        name_label = QLabel(name)
+        name_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        f = QFont()
+        f.setBold(True)
+        f.setPointSize(11)
+        name_label.setFont(f)
+        layout.addWidget(name_label)
+
+        self.temp_label = QLabel("-- °C")
+        self.temp_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.temp_label)
+
+    def set_usage(self, value):
+        self.gauge.setValue(value)
+
+    def set_temp_text(self, text):
+        self.temp_label.setText(text)
+
+
+class SystemTab(QWidget):
+    def __init__(self):
+        super().__init__()
+        outer = QVBoxLayout(self)
+        outer.addWidget(QLabel("<b>System Monitor</b>"))
+
+        gauges_row = QHBoxLayout()
+        self.cpu_gauge = MetricGauge("CPU")
+        self.ram_gauge = MetricGauge("RAM")
+        self.gpu_gauge = MetricGauge("GPU")
+        gauges_row.addWidget(self.cpu_gauge)
+        gauges_row.addWidget(self.ram_gauge)
+        gauges_row.addWidget(self.gpu_gauge)
+        outer.addLayout(gauges_row)
+
+        if not NVML_AVAILABLE:
+            outer.addWidget(QLabel("GPU usage unavailable (install pynvml for NVIDIA GPUs)"))
+
+        outer.addWidget(QLabel(
+            "CPU temp and RAM temp aren't exposed by any built-in Windows API, so they'll "
+            "show N/A here. GPU temp/usage work out of the box for NVIDIA cards only."
+        ))
+
+        outer.addStretch()
+
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.update_stats)
+        self.timer.start(1000)
+        self.update_stats()
+
+    def update_stats(self):
+        self.cpu_gauge.set_usage(psutil.cpu_percent())
+        self.ram_gauge.set_usage(psutil.virtual_memory().percent)
+
+        cpu_temp = get_cpu_temp()
+        self.cpu_gauge.set_temp_text(f"{cpu_temp} °C" if cpu_temp is not None else "N/A")
+
+        gpu_temp = get_gpu_temp()
+        self.gpu_gauge.set_temp_text(f"{gpu_temp} °C" if gpu_temp is not None else "N/A")
+
+        ram_temp = get_ram_temp()
+        self.ram_gauge.set_temp_text(f"{ram_temp} °C" if ram_temp is not None else "N/A")
+
+        if NVML_AVAILABLE:
+            try:
+                handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+                util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+                self.gpu_gauge.set_usage(util.gpu)
+            except Exception:
+                pass
+        else:
+            self.gpu_gauge.set_usage(0)
+
+
+# ---------------------------------------------------------------------------
+# Main window
+# ---------------------------------------------------------------------------
+
+class ControlCenter(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Mini Control Center")
+        self.resize(640, 760)
+
+        central = QWidget()
+        layout = QVBoxLayout(central)
+
+        system_tab = SystemTab()
+        layout.addWidget(system_tab, 0)
+
+        separator = QFrame()
+        separator.setFrameShape(QFrame.Shape.HLine)
+        separator.setFrameShadow(QFrame.Shadow.Sunken)
+        layout.addWidget(separator)
+
+        mixer_tab = MixerTab()
+        layout.addWidget(mixer_tab, 1)
+
+        self.setCentralWidget(central)
+
+
+def main():
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+    window = ControlCenter()
+    window.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
