@@ -19,6 +19,7 @@ REM its "libs" folder to sit right next to DeskDeck.exe.
     --add-data "libs;libs" ^
     --collect-all pythonnet ^
     --collect-all clr ^
+    --collect-all clr_loader ^
     --collect-submodules comtypes.gen ^
     main.py
 

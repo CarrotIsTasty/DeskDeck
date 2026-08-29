@@ -805,42 +805,76 @@ _lhm_init_attempted = False
 
 
 def _init_lhm():
-    """Load pythonnet + LibreHardwareMonitorLib and open a Computer object,
-    once. Leaves _lhm_computer as None (and never retries) if anything about
-    the setup is missing - CPU temp then just stays "N/A" for the session."""
+    """Load pythonnet + LibreHardwareMonitorLib and open a Computer object.
+    Robustly handles PyInstaller pre-initialized CLR and companion DLL dependencies."""
     global _lhm_computer, _lhm_hardware_type, _lhm_sensor_type, _lhm_init_attempted
+    if _lhm_computer is not None:
+        return
     if _lhm_init_attempted:
         return
-    _lhm_init_attempted = True
 
     if not os.path.exists(LHM_DLL_PATH):
         return
 
     try:
-        from pythonnet import load
-        load("netfx")  # use the .NET Framework CLR already on Windows
+        try:
+            from pythonnet import load
+            load("netfx")  # use the .NET Framework CLR on Windows
+        except Exception:
+            # Runtime may already be initialized (e.g. inside PyInstaller) or netfx default
+            pass
+
         import clr
+        dll_dir = os.path.dirname(os.path.abspath(LHM_DLL_PATH))
+        if dll_dir not in sys.path:
+            sys.path.insert(0, dll_dir)
+
         clr.AddReference(LHM_DLL_PATH)
         from LibreHardwareMonitor.Hardware import Computer, HardwareType, SensorType
 
         computer = Computer()
         computer.IsCpuEnabled = True
         computer.IsMemoryEnabled = True
+        computer.IsMotherboardEnabled = True
+        computer.IsControllerEnabled = True
         computer.Open()
-    except Exception:
+
+        _lhm_computer = computer
+        _lhm_hardware_type = HardwareType
+        _lhm_sensor_type = SensorType
+    except Exception as e:
+        print(f"LHM init exception: {e}")
+        _lhm_init_attempted = True
         return
 
-    _lhm_computer = computer
-    _lhm_hardware_type = HardwareType
-    _lhm_sensor_type = SensorType
+
+def _collect_sensors_recursive(hardware, target_type, temps):
+    """Recursively collect temperature sensors from hardware and any SubHardware."""
+    try:
+        if hardware.HardwareType == target_type:
+            hardware.Update()
+            for sensor in hardware.Sensors:
+                if sensor.SensorType == _lhm_sensor_type.Temperature:
+                    val = sensor.Value
+                    if val is not None:
+                        try:
+                            fval = float(val)
+                            if 10.0 <= fval <= 125.0:
+                                temps.append(fval)
+                        except (ValueError, TypeError):
+                            pass
+
+        if hasattr(hardware, "SubHardware"):
+            for sub in hardware.SubHardware:
+                _collect_sensors_recursive(sub, target_type, temps)
+    except Exception:
+        pass
 
 
 def _lhm_max_temp(hardware_type_name):
     """Highest current temperature sensor reading among all hardware of the
     given LibreHardwareMonitor.Hardware.HardwareType (looked up by name, e.g.
-    "Cpu" or "Memory"), in whole degrees C, or None if the DLL/pythonnet/
-    elevation aren't all in place, or that hardware has no temperature
-    sensor at all (true for most laptop RAM - see the section header above)."""
+    "Cpu" or "Memory"), in whole degrees C, or None."""
     _init_lhm()
     if _lhm_computer is None:
         return None
@@ -852,22 +886,60 @@ def _lhm_max_temp(hardware_type_name):
     temps = []
     try:
         for hardware in _lhm_computer.Hardware:
-            if hardware.HardwareType != target_type:
-                continue
-            hardware.Update()
-            for sensor in hardware.Sensors:
-                if sensor.SensorType == _lhm_sensor_type.Temperature and sensor.Value:
-                    temps.append(float(sensor.Value))
+            _collect_sensors_recursive(hardware, target_type, temps)
     except Exception:
         return None
+
+    if not temps:
+        # Fallback for laptops where CPU temp is exposed under Motherboard / SuperIO / EC
+        if hardware_type_name == "Cpu":
+            try:
+                for hardware in _lhm_computer.Hardware:
+                    hardware.Update()
+                    for sensor in hardware.Sensors:
+                        if sensor.SensorType == _lhm_sensor_type.Temperature and sensor.Value is not None:
+                            s_name = str(sensor.Name).lower()
+                            if any(k in s_name for k in ["cpu", "core", "package", "processor", "tjmax", "soc"]):
+                                try:
+                                    fval = float(sensor.Value)
+                                    if 10.0 <= fval <= 125.0:
+                                        temps.append(fval)
+                                except (ValueError, TypeError):
+                                    pass
+            except Exception:
+                pass
 
     if not temps:
         return None
     return int(round(max(temps)))
 
 
+def _get_wmi_cpu_temp_fallback():
+    """Fallback CPU temperature via Windows WMI ACPI thermal zone if available."""
+    try:
+        import win32com.client
+        wmi = win32com.client.GetObject("winmgmts:\\\\.\\root\\wmi")
+        results = wmi.ExecQuery("SELECT CurrentTemperature FROM MSAcpi_ThermalZoneTemperature")
+        temps = []
+        for item in results:
+            raw = item.CurrentTemperature
+            if raw and raw > 2732:
+                # Tenths of Kelvin to Celsius
+                celsius = (raw - 2732) / 10.0
+                if 10.0 <= celsius <= 125.0:
+                    temps.append(celsius)
+        if temps:
+            return int(round(max(temps)))
+    except Exception:
+        pass
+    return None
+
+
 def get_cpu_temp():
-    return _lhm_max_temp("Cpu")
+    temp = _lhm_max_temp("Cpu")
+    if temp is None:
+        temp = _get_wmi_cpu_temp_fallback()
+    return temp
 
 
 def get_gpu_temp():

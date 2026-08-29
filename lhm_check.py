@@ -57,10 +57,11 @@ def main():
 
     print("--- Step 2: load the .NET runtime via pythonnet ---")
     try:
-        from pythonnet import load
-        # Use the .NET Framework CLR already built into Windows, so nobody
-        # needs to separately install a .NET (Core) runtime.
-        load("netfx")
+        try:
+            from pythonnet import load
+            load("netfx")
+        except Exception:
+            pass
         import clr
     except ImportError:
         print("pythonnet isn't installed. Run: pip install pythonnet")
@@ -74,6 +75,9 @@ def main():
 
     print("--- Step 3: load LibreHardwareMonitorLib.dll ---")
     try:
+        dll_dir = os.path.dirname(os.path.abspath(DLL_PATH))
+        if dll_dir not in sys.path:
+            sys.path.insert(0, dll_dir)
         clr.AddReference(DLL_PATH)
         from LibreHardwareMonitor.Hardware import Computer, HardwareType, SensorType
     except Exception as e:
@@ -84,39 +88,49 @@ def main():
         return
     print("DLL loaded.\n")
 
-    print("--- Step 4: open the Computer object and read CPU sensors ---")
+    print("--- Step 4: open Computer object and read all hardware sensors ---")
     try:
         computer = Computer()
         computer.IsCpuEnabled = True
+        computer.IsMotherboardEnabled = True
+        computer.IsControllerEnabled = True
         computer.Open()
     except Exception as e:
         print(f"Failed to open Computer(): {e!r}")
         return
 
     found_any = False
+
+    def print_hardware_sensors(hardware, depth=0):
+        nonlocal found_any
+        indent = "  " * depth
+        hardware.Update()
+        print(f"{indent}[{hardware.HardwareType}] {hardware.Name}")
+        for sensor in hardware.Sensors:
+            if sensor.SensorType == SensorType.Temperature:
+                val = sensor.Value
+                if val is not None:
+                    found_any = True
+                print(f"{indent}  * Temp: {sensor.Name} = {val if val is not None else '(null/empty)'}")
+        if hasattr(hardware, "SubHardware"):
+            for sub in hardware.SubHardware:
+                print_hardware_sensors(sub, depth + 1)
+
     try:
         for hardware in computer.Hardware:
-            if hardware.HardwareType != HardwareType.Cpu:
-                continue
-            hardware.Update()
-            print(f"CPU: {hardware.Name}")
-            for sensor in hardware.Sensors:
-                if sensor.SensorType == SensorType.Temperature:
-                    found_any = True
-                    val = sensor.Value
-                    print(f"  {sensor.Name}: {val if val is not None else '(no value)'}")
+            print_hardware_sensors(hardware)
     finally:
         computer.Close()
 
     print()
     if found_any:
-        print("RESULT: sensors enumerated successfully. If the values above look like")
-        print("real temperatures (not blank/0), paste this whole output back and CPU")
-        print("temp can be wired into the main app.")
+        print("RESULT: Sensor values read successfully!")
     else:
-        print("RESULT: no temperature sensors were found. If you weren't running as")
-        print("Administrator, that's almost certainly why - retry elevated. If you")
-        print("were already elevated, paste this whole output back.")
+        print("RESULT: Temperature sensor objects exist, but their values are (null/empty).")
+        print("Reasons:")
+        print("1. Process is not elevated (Run as administrator).")
+        print("2. Windows 11 'Microsoft Vulnerable Driver Blocklist' / Core Isolation is blocking WinRing0x64.sys.")
+
 
 
 if __name__ == "__main__":
