@@ -1230,14 +1230,33 @@ class MetricGauge(QWidget):
         self.gauge.setValue(value)
 
     def set_detail_text(self, text):
+        # Full text is kept so it can be re-elided on resize instead of
+        # elided once at whatever width the card happened to be at the time.
+        self._detail_full_text = text or ""
         if not text:
             self.detail_label.setVisible(False)
             return
         self.detail_label.setToolTip(text)
-        metrics = QFontMetrics(self.detail_label.font())
-        elided = metrics.elidedText(text, Qt.TextElideMode.ElideRight, 150)
-        self.detail_label.setText(elided)
         self.detail_label.setVisible(True)
+        self._reelide_detail_text()
+
+    def _reelide_detail_text(self):
+        text = getattr(self, "_detail_full_text", "")
+        if not text:
+            return
+        # Elide to the label's own current width, not a fixed guess - this
+        # is what makes widening the window actually reveal more of the
+        # name instead of staying truncated at the same point.
+        width = self.detail_label.width()
+        if width <= 0:
+            width = self.width() - 24  # fallback before the first layout pass
+        metrics = QFontMetrics(self.detail_label.font())
+        elided = metrics.elidedText(text, Qt.TextElideMode.ElideRight, max(width, 0))
+        self.detail_label.setText(elided)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._reelide_detail_text()
 
     def set_temp_text(self, text):
         self.temp_label.setText(text)
