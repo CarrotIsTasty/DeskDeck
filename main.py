@@ -45,19 +45,37 @@ import json
 import winreg
 import ctypes
 import subprocess
-import psutil
 
-from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QSlider, QPushButton, QScrollArea, QFrame, QTabWidget,
-    QProgressBar, QCheckBox, QGraphicsDropShadowEffect, QSizePolicy,
-    QSystemTrayIcon, QMenu, QMessageBox
-)
-from PyQt6.QtCore import Qt, QTimer, QRectF
-from PyQt6.QtGui import (
-    QPainter, QPen, QColor, QFont, QConicalGradient, QFontMetrics,
-    QIcon, QPixmap
-)
+# Auto-relaunch via local venv if third-party modules are missing in the current Python environment
+_app_dir = os.path.dirname(os.path.abspath(sys.executable)) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
+_venv_python = os.path.join(_app_dir, "venv", "Scripts", "python.exe")
+_venv_pythonw = os.path.join(_app_dir, "venv", "Scripts", "pythonw.exe")
+
+try:
+    import psutil
+    from PyQt6.QtWidgets import (
+        QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+        QLabel, QSlider, QPushButton, QScrollArea, QFrame, QTabWidget,
+        QProgressBar, QCheckBox, QGraphicsDropShadowEffect, QSizePolicy,
+        QSystemTrayIcon, QMenu, QMessageBox
+    )
+    from PyQt6.QtCore import Qt, QTimer, QRectF
+    from PyQt6.QtGui import (
+        QPainter, QPen, QColor, QFont, QConicalGradient, QFontMetrics,
+        QIcon, QPixmap
+    )
+except ImportError as _err:
+    if not getattr(sys, "frozen", False) and (os.path.exists(_venv_python) or os.path.exists(_venv_pythonw)):
+        _target_py = _venv_pythonw if os.path.exists(_venv_pythonw) else _venv_python
+        if sys.executable.lower() != _target_py.lower():
+            subprocess.run([_target_py, os.path.abspath(__file__)] + sys.argv[1:])
+            sys.exit(0)
+    print(f"\n[DeskDeck Error] Missing dependency: {_err}")
+    print("To fix this, please run: start.bat (which auto-installs dependencies)")
+    print("or run in terminal: pip install -r requirements.txt\n")
+    if sys.stdin and sys.stdin.isatty():
+        input("Press Enter to exit...")
+    sys.exit(1)
 
 if getattr(sys, "frozen", False):
     # Running as a PyInstaller-built .exe: use the folder the .exe lives in,
