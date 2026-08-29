@@ -1,5 +1,5 @@
 """
-Mini Control Center
+DeskDeck
 --------------------
 A prototype Windows control panel that lets you:
   - See every app currently playing audio and control its volume/mute individually,
@@ -1345,7 +1345,7 @@ class SystemTab(QWidget):
 class ControlCenter(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Mini Control Center")
+        self.setWindowTitle("DeskDeck")
         self.setWindowIcon(build_app_icon())
         self.resize(700, 700)
         self.setMinimumSize(560, 560)
@@ -1366,7 +1366,7 @@ class ControlCenter(QMainWindow):
 
         title_box = QVBoxLayout()
         title_box.setSpacing(0)
-        title = QLabel("Mini Control Center")
+        title = QLabel("DeskDeck")
         title.setObjectName("AppTitle")
 
         subtitle_row = QHBoxLayout()
@@ -1386,7 +1386,7 @@ class ControlCenter(QMainWindow):
         subtitle_row.addWidget(self.always_on_top_checkbox)
 
         self.startup_checkbox = QCheckBox("Start with Windows")
-        self.startup_checkbox.setToolTip("Launch Mini Control Center automatically when you sign in")
+        self.startup_checkbox.setToolTip("Launch DeskDeck automatically when you sign in")
         self.startup_checkbox.setCursor(Qt.CursorShape.PointingHandCursor)
         self.startup_checkbox.setChecked(is_startup_enabled())
         self.startup_checkbox.stateChanged.connect(self.toggle_startup)
@@ -1428,10 +1428,10 @@ class ControlCenter(QMainWindow):
 
     def _setup_tray(self):
         self.tray_icon = QSystemTrayIcon(build_app_icon(), self)
-        self.tray_icon.setToolTip("Mini Control Center")
+        self.tray_icon.setToolTip("DeskDeck")
 
         tray_menu = QMenu()
-        show_action = tray_menu.addAction("Show Mini Control Center")
+        show_action = tray_menu.addAction("Show DeskDeck")
         show_action.triggered.connect(self.show_and_raise)
         tray_menu.addSeparator()
         quit_action = tray_menu.addAction("Quit")
@@ -1471,7 +1471,7 @@ class ControlCenter(QMainWindow):
         event.ignore()
         self.hide()
         self.tray_icon.showMessage(
-            "Mini Control Center",
+            "DeskDeck",
             "Still running in the background. Right-click the tray icon to quit.",
             QSystemTrayIcon.MessageIcon.Information,
             2000,

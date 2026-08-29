@@ -3,7 +3,7 @@ Standalone LibreHardwareMonitorLib diagnostic.
 
 Checks that pythonnet can load LibreHardwareMonitorLib.dll in-process and
 read real CPU temperature sensors, before this gets wired into the full
-Mini Control Center app.
+DeskDeck app.
 
 IMPORTANT: run this AS ADMINISTRATOR (right-click the terminal / this
 script -> "Run as administrator", or launch an elevated cmd/PowerShell

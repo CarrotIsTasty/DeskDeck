@@ -1,5 +1,5 @@
 @echo off
-echo Registering the elevated Scheduled Task for Mini Control Center...
+echo Registering the elevated Scheduled Task for DeskDeck...
 echo.
 echo IMPORTANT: this needs to run AS ADMINISTRATOR. If you just double-clicked
 echo this file normally, close this window, then right-click
