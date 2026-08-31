@@ -1693,6 +1693,14 @@ SWP_NOSIZE = 0x0001
 SWP_NOMOVE = 0x0002
 SWP_NOACTIVATE = 0x0010
 
+GWL_EXSTYLE = -20
+# The overlay never takes the keyboard focus, so clicking it - or dragging it
+# around - cannot pull a game out of the foreground.
+WS_EX_NOACTIVATE = 0x08000000
+# ...and with this one the window is not hit-tested at all: the click lands on
+# whatever is underneath instead. See apply_click_through().
+WS_EX_TRANSPARENT = 0x00000020
+
 try:
     _user32 = ctypes.windll.user32
     # Without explicit argtypes ctypes would pass the window handles as 32-bit
@@ -1703,8 +1711,18 @@ try:
         ctypes.c_uint,
     ]
     _user32.SetWindowPos.restype = wintypes.BOOL
+    # GetWindowLongW truncates to 32 bits, which is fine for the extended
+    # style word but not for everything the API can return; the Ptr variants
+    # only exist on 64-bit builds, so fall back where they are missing.
+    _get_long = getattr(_user32, "GetWindowLongPtrW", _user32.GetWindowLongW)
+    _set_long = getattr(_user32, "SetWindowLongPtrW", _user32.SetWindowLongW)
+    _get_long.argtypes = [wintypes.HWND, ctypes.c_int]
+    _get_long.restype = ctypes.c_ssize_t
+    _set_long.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_ssize_t]
+    _set_long.restype = ctypes.c_ssize_t
 except Exception:
     _user32 = None
+    _get_long = _set_long = None
 
 
 def apply_topmost(widget, enabled):
@@ -1725,6 +1743,50 @@ def apply_topmost(widget, enabled):
         0, 0, 0, 0,
         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
     )
+
+
+def _set_ex_style_bits(widget, bits, enabled):
+    """Flip bits in the native window's extended style word."""
+    if _get_long is None or _set_long is None:
+        return False
+    try:
+        hwnd = int(widget.winId())
+    except Exception:
+        return False
+    if not hwnd:
+        return False
+    handle = ctypes.c_void_p(hwnd)
+    style = _get_long(handle, GWL_EXSTYLE)
+    updated = (style | bits) if enabled else (style & ~bits)
+    if updated != style:
+        _set_long(handle, GWL_EXSTYLE, updated)
+    return True
+
+
+def apply_no_activate(widget):
+    """Stop the window ever becoming the foreground one.
+
+    Qt.WindowDoesNotAcceptFocus in the constructor already asks for this, and
+    it does hold - but only from the moment the native window is created, and
+    changing window flags recreates it. Re-asserting after every show() costs
+    one syscall and removes that as something to remember."""
+    _set_ex_style_bits(widget, WS_EX_NOACTIVATE, True)
+
+
+def apply_click_through(widget, enabled):
+    """Make the window invisible to the mouse, or clickable again.
+
+    WS_EX_TRANSPARENT takes the window out of hit-testing entirely: the click
+    is delivered to whatever sits underneath, exactly as if the overlay were
+    not there. That is the only thing that reliably keeps a click landing on
+    the overlay's pixels from doing anything at all to a game behind it -
+    WS_EX_NOACTIVATE alone keeps the game in the foreground, but the overlay
+    still swallows the click, so a shot or an ability would be eaten.
+
+    Qt's WA_TransparentForMouseEvents is set alongside it so Qt's own event
+    dispatch agrees with the OS about who owns the mouse."""
+    widget.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, enabled)
+    _set_ex_style_bits(widget, WS_EX_TRANSPARENT, enabled)
 
 
 # ---------------------------------------------------------------------------
@@ -1749,13 +1811,24 @@ class OverlayWindow(QWidget):
     Frameless also means there is no title bar to drag it by, so the whole
     widget acts as the drag handle (see mousePressEvent below). That is only
     possible because the background is painted at alpha 0.02 rather than 0 -
-    see the OverlayCard rule in STYLE_SHEET for why."""
+    see the OverlayCard rule in STYLE_SHEET for why.
+
+    That drag handle is also why the window has a locked state. Mid-game the
+    overlay sits over a live playfield, and a click that lands on it is a
+    click the game does not get - at best a wasted input, at worst a drag
+    that shifts the readout, and with an ordinary window it would pull the
+    game out of the foreground as well. Locked (the default) the overlay is
+    click-through and inert; unlock it from the tray menu to move it, then
+    lock it again. See set_click_through()."""
 
     backRequested = pyqtSignal()
 
     # Width of the close glyph, and so also the width every other row
     # reserves on its right to keep the value column aligned.
     CLOSE_SIZE = 18
+
+    # Blanked out while the overlay is locked, so keep it addressable.
+    CLOSE_GLYPH = "\u2715"
 
     # Height of every row. Deliberately tighter than the labels' natural line
     # box - at 11pt that box is 20px around ~15px of ink, and three of them
@@ -1768,7 +1841,10 @@ class OverlayWindow(QWidget):
             None,
             Qt.WindowType.Tool
             | Qt.WindowType.FramelessWindowHint
-            | Qt.WindowType.WindowStaysOnTopHint,
+            | Qt.WindowType.WindowStaysOnTopHint
+            # Never take the focus, locked or not: even while unlocked for a
+            # drag, grabbing the overlay must not tab the game out.
+            | Qt.WindowType.WindowDoesNotAcceptFocus,
         )
         self.setObjectName("OverlayRoot")
         self.setWindowTitle("DeskDeck")
@@ -1777,6 +1853,7 @@ class OverlayWindow(QWidget):
         # the game through - without it the window would be a black slab.
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self._drag_offset = None
+        self._click_through = False
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -1797,12 +1874,13 @@ class OverlayWindow(QWidget):
         # get. The rows below reserve the same width on their right (the
         # gutter in _add_row), so the temperatures stay in one column instead
         # of the CPU one sitting proud of the other two.
-        close = QPushButton("\u2715")
+        close = QPushButton(self.CLOSE_GLYPH)
         close.setObjectName("OverlayClose")
         close.setCursor(Qt.CursorShape.PointingHandCursor)
         close.setToolTip("Back to the full DeskDeck window")
         close.setFixedSize(self.CLOSE_SIZE, self.ROW_HEIGHT)
         close.clicked.connect(self.backRequested.emit)
+        self.close_button = close
 
         self.cpu_usage, self.cpu_value = self._add_row(
             body, "CPU", usage=True, trailing=close)
@@ -1883,6 +1961,27 @@ class OverlayWindow(QWidget):
         else:
             self.ram_value.setText(f"{used:.1f} / {total:.1f} GB")
 
+    # -- locking -----------------------------------------------------------
+    def set_click_through(self, enabled):
+        """Locked: the overlay is a picture the mouse passes straight through,
+        so a click at its position reaches the game instead of it. Unlocked:
+        it can be dragged and closed again.
+
+        The close glyph goes with it. Leaving an X on screen that swallows
+        nothing would just be a button that does not work, so it is blanked
+        rather than hidden - the button keeps its fixed size either way, and
+        hiding it would let the layout reclaim the width the other two rows
+        reserve to stay aligned with it."""
+        self._click_through = bool(enabled)
+        apply_click_through(self, self._click_through)
+        self.close_button.setText("" if self._click_through else self.CLOSE_GLYPH)
+        if self._click_through:
+            # A drag in progress would otherwise never see its release.
+            self._drag_offset = None
+
+    def is_click_through(self):
+        return self._click_through
+
     # -- dragging, since there is no title bar to grab ---------------------
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -1929,6 +2028,11 @@ class ControlCenter(QMainWindow):
         self.overlay = None
         self._overlay_mode = False
         self._overlay_placed = False
+        # Locked by default: an overlay you can click is an overlay that eats
+        # a shot the first time you happen to aim through it.
+        self._overlay_click_through = bool(
+            self._saved_state.get("overlay_click_through", True))
+        self._overlay_hint_shown = False
 
         geometry_hex = self._saved_state.get("geometry_hex")
         if geometry_hex:
@@ -1983,7 +2087,9 @@ class ControlCenter(QMainWindow):
         self.overlay_button = QPushButton("Overlay")
         self.overlay_button.setToolTip(
             "Shrink to a small frameless readout - CPU temp, RAM and GPU temp "
-            "only - that stays on top of everything else"
+            "only - that stays on top of everything else. Locked by default, "
+            "so clicks pass through it to the game underneath; the tray icon "
+            "brings this window back."
         )
         self.overlay_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.overlay_button.clicked.connect(self.enter_overlay_mode)
@@ -2148,7 +2254,13 @@ class ControlCenter(QMainWindow):
         # Show the last poll straight away instead of "--" for up to a second.
         self.overlay.update_stats(self.system_tab.latest_stats())
         self.overlay.show()
+        # After show(), not before: the native window has to exist for the
+        # extended styles to be set on, and showing a window Qt had to create
+        # or re-create is where they would otherwise be lost.
+        apply_no_activate(self.overlay)
+        self.overlay.set_click_through(self._overlay_click_through)
         self._sync_topmost()
+        self._hint_click_through()
 
     def exit_overlay_mode(self):
         if not self._overlay_mode:
@@ -2162,6 +2274,40 @@ class ControlCenter(QMainWindow):
         self.raise_()
         self._sync_topmost()
         self._persist_state()
+
+    def set_overlay_click_through(self, enabled):
+        """Tray menu: lock the overlay out of the mouse's way, or hand it back
+        so it can be dragged somewhere else."""
+        self._overlay_click_through = bool(enabled)
+        if self.overlay is not None:
+            self.overlay.set_click_through(self._overlay_click_through)
+        self._persist_state()
+        if self._overlay_click_through:
+            self._overlay_hint_shown = False
+            self._hint_click_through()
+        elif self._overlay_mode:
+            self.tray_icon.showMessage(
+                "Overlay unlocked",
+                "Drag it anywhere, or click the X to come back. Clicks land "
+                "on the overlay again until you lock it.",
+                QSystemTrayIcon.MessageIcon.Information,
+                4000,
+            )
+
+    def _hint_click_through(self):
+        """Locked, there is no X and nothing to click, so say once per run
+        where the way back is."""
+        if (not self._overlay_mode or not self._overlay_click_through
+                or self._overlay_hint_shown):
+            return
+        self._overlay_hint_shown = True
+        self.tray_icon.showMessage(
+            "Overlay locked",
+            "Clicks pass straight through to whatever is behind it. Use this "
+            "tray icon to bring DeskDeck back, or to unlock it for a move.",
+            QSystemTrayIcon.MessageIcon.Information,
+            4000,
+        )
 
     def _place_overlay(self):
         """Back where it was left, or tucked into the top-right corner of the
@@ -2189,6 +2335,11 @@ class ControlCenter(QMainWindow):
         show_action.triggered.connect(self.show_and_raise)
         overlay_action = tray_menu.addAction("Overlay mode")
         overlay_action.triggered.connect(self.enter_overlay_mode)
+        lock_action = tray_menu.addAction("Lock overlay (click-through)")
+        lock_action.setCheckable(True)
+        lock_action.setChecked(self._overlay_click_through)
+        lock_action.toggled.connect(self.set_overlay_click_through)
+        self.overlay_lock_action = lock_action
         tray_menu.addSeparator()
         quit_action = tray_menu.addAction("Quit")
         quit_action.triggered.connect(self._quit)
@@ -2220,6 +2371,7 @@ class ControlCenter(QMainWindow):
             "always_on_top": self.always_on_top_checkbox.isChecked(),
             "mixer_collapsed": self.mixer_tab.collapsed,
             "overlay_mode": self._overlay_mode,
+            "overlay_click_through": self._overlay_click_through,
         }
         # saveGeometry() still reports the last real placement after a window
         # is hidden, so this is correct whichever mode we are in.
