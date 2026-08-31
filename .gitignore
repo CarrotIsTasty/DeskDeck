@@ -30,3 +30,7 @@ window_state.json
 build/
 dist/
 *.spec
+
+# Debug symbols shipped alongside the LibreHardwareMonitor DLLs - not
+# needed at runtime, only the .dll files are loaded
+*.pdb
