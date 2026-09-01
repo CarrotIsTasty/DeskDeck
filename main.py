@@ -44,6 +44,7 @@ import os
 import json
 import winreg
 import ctypes
+from ctypes import wintypes
 import subprocess
 
 # Auto-relaunch via local venv if third-party modules are missing in the current Python environment
@@ -59,7 +60,7 @@ try:
         QProgressBar, QCheckBox, QGraphicsDropShadowEffect, QSizePolicy,
         QSystemTrayIcon, QMenu, QMessageBox
     )
-    from PyQt6.QtCore import Qt, QTimer, QRectF
+    from PyQt6.QtCore import Qt, QTimer, QRectF, pyqtSignal
     from PyQt6.QtGui import (
         QPainter, QPen, QColor, QFont, QConicalGradient, QFontMetrics,
         QIcon, QPixmap
@@ -117,6 +118,11 @@ TEXT_DIM = "#8b8ea3"
 GOOD = "#4cd97b"
 WARN = "#ffc857"
 BAD = "#ff6b6b"
+
+# Chevrons for the collapse toggle - pointing down when a section is open,
+# right when it's folded away.
+CHEVRON_DOWN = "▾"
+CHEVRON_RIGHT = "▸"
 
 STYLE_SHEET = f"""
 QMainWindow, QWidget {{
@@ -295,6 +301,21 @@ QPushButton#HideButton {{
     color: {TEXT_DIM};
 }}
 
+QPushButton#CollapseButton {{
+    background: transparent;
+    border: none;
+    color: {TEXT_DIM};
+    font-size: 11pt;
+    font-weight: 700;
+    padding: 2px 0px;
+}}
+
+QPushButton#CollapseButton:hover {{
+    background-color: {CARD};
+    border: none;
+    color: {TEXT};
+}}
+
 QPushButton#MuteButton[muted="true"] {{
     background-color: #3a2430;
     border: 1px solid #6e3550;
@@ -347,6 +368,69 @@ QSlider::handle:vertical:hover {{
 QFrame#AppCard QPushButton {{
     font-size: 7.5pt;
     padding: 4px 2px;
+}}
+
+/* Overlay mode - deliberately plain. No gauges, no cards, no chrome and no
+   visible background: just the numbers, floating over whatever is behind
+   them, sized to be readable at a glance without covering anything.
+
+   The background alpha is 0.02, not 0, and that matters. Qt reads the fourth
+   rgba() argument as a 0.0-1.0 fraction, not as 0-255, so 1 here would mean
+   fully opaque rather than 1/255. WA_TranslucentBackground makes this a
+   WS_EX_LAYERED window, and Windows hit-tests layered windows against the
+   alpha channel: pixels at alpha 0 are click-through, so the mouse never
+   reaches us and the window cannot be dragged - and being frameless, there is
+   no title bar to fall back on. 2% is imperceptible but keeps every pixel
+   clickable. Raise it for a visible tint; do not drop it to 0. */
+
+QWidget#OverlayRoot {{
+    background: transparent;
+}}
+
+/* The blank that reserves the close glyph's width on the rows that don't
+   carry it. Without an explicit rule it matches the app-wide "QWidget"
+   background above and paints a solid square over the game. */
+QWidget#OverlayGutter {{
+    background: transparent;
+}}
+
+QFrame#OverlayCard {{
+    background-color: rgba(0, 0, 0, 0.02);
+    border: none;
+}}
+
+QLabel#OverlayLabel {{
+    color: {TEXT_DIM};
+    font-size: 9pt;
+    font-weight: 600;
+    background: transparent;
+}}
+
+QLabel#OverlayUsage {{
+    color: {TEXT};
+    font-size: 10pt;
+    font-weight: 700;
+    background: transparent;
+}}
+
+QLabel#OverlayValue {{
+    color: {TEXT};
+    font-size: 11pt;
+    font-weight: 700;
+    background: transparent;
+}}
+
+QPushButton#OverlayClose {{
+    background: transparent;
+    border: none;
+    color: {TEXT_DIM};
+    font-size: 10pt;
+    font-weight: 700;
+    padding: 0px;
+}}
+
+QPushButton#OverlayClose:hover {{
+    color: {BAD};
 }}
 """
 
@@ -1137,7 +1221,11 @@ class AppVolumeRow(QFrame):
 # ---------------------------------------------------------------------------
 
 class MixerTab(QWidget):
-    def __init__(self):
+    # Emitted whenever the mixer folds away or comes back, so the window can
+    # shrink to just the system monitor instead of leaving a hole behind.
+    collapsedChanged = pyqtSignal(bool)
+
+    def __init__(self, collapsed=False):
         super().__init__()
         self.hidden_identifiers = load_hidden_identifiers()
         self.volume_prefs = load_volume_prefs()
@@ -1149,6 +1237,20 @@ class MixerTab(QWidget):
         outer.setSpacing(10)
 
         header = QHBoxLayout()
+        header.setSpacing(8)
+
+        # Sometimes you only want the system monitor on screen, so the whole
+        # mixer body folds away behind this chevron - the header stays put as
+        # a one-line handle to bring it back.
+        self.collapsed = False
+        self.collapse_button = QPushButton(CHEVRON_DOWN)
+        self.collapse_button.setObjectName("CollapseButton")
+        self.collapse_button.setToolTip("Hide the volume mixer")
+        self.collapse_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.collapse_button.setFixedWidth(22)
+        self.collapse_button.clicked.connect(self.toggle_collapsed)
+        header.addWidget(self.collapse_button)
+
         title = QLabel("App Volume Mixer")
         title.setObjectName("SectionHeader")
         header.addWidget(title)
@@ -1160,11 +1262,11 @@ class MixerTab(QWidget):
         self.show_hidden_checkbox.stateChanged.connect(self.toggle_show_hidden)
         header.addWidget(self.show_hidden_checkbox)
 
-        refresh_btn = QPushButton("Refresh")
-        refresh_btn.setObjectName("RefreshButton")
-        refresh_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        refresh_btn.clicked.connect(self.rebuild_rows)
-        header.addWidget(refresh_btn)
+        self.refresh_button = QPushButton("Refresh")
+        self.refresh_button.setObjectName("RefreshButton")
+        self.refresh_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.refresh_button.clicked.connect(self.rebuild_rows)
+        header.addWidget(self.refresh_button)
         outer.addLayout(header)
 
         # Channels sit side by side, like a real mixer console - Master first,
@@ -1185,6 +1287,7 @@ class MixerTab(QWidget):
         self.container_layout.setSpacing(10)
         self.container_layout.addStretch()
         scroll.setWidget(self.container)
+        self.scroll = scroll
         outer.addWidget(scroll)
 
         self.rebuild_rows()
@@ -1193,6 +1296,41 @@ class MixerTab(QWidget):
         self.timer = QTimer()
         self.timer.timeout.connect(self.rebuild_rows)
         self.timer.start(4000)
+
+        if collapsed:
+            self.set_collapsed(True)
+
+    def set_polling_enabled(self, enabled):
+        """Overlay mode takes the mixer off screen entirely, and rebuilding it
+        means walking every audio session over COM - so let it rest until the
+        full window comes back."""
+        if enabled:
+            if not self.timer.isActive():
+                self.rebuild_rows()
+                self.timer.start()
+        else:
+            self.timer.stop()
+
+    def toggle_collapsed(self):
+        self.set_collapsed(not self.collapsed)
+
+    def set_collapsed(self, collapsed):
+        self.collapsed = collapsed
+        # Only the header survives - everything that takes vertical space goes.
+        self.scroll.setVisible(not collapsed)
+        self.show_hidden_checkbox.setVisible(not collapsed)
+        self.refresh_button.setVisible(not collapsed)
+        self.collapse_button.setText(CHEVRON_RIGHT if collapsed else CHEVRON_DOWN)
+        self.collapse_button.setToolTip(
+            "Show the volume mixer" if collapsed else "Hide the volume mixer"
+        )
+        if collapsed:
+            # No point polling audio sessions for rows nobody can see.
+            self.timer.stop()
+        else:
+            self.rebuild_rows()
+            self.timer.start(4000)
+        self.collapsedChanged.emit(collapsed)
 
     def toggle_show_hidden(self, state):
         self.show_hidden = bool(state)
@@ -1424,8 +1562,14 @@ class MetricGauge(QWidget):
 
 
 class SystemTab(QWidget):
+    # Emitted after every poll. The overlay listens to this instead of
+    # starting its own timer, so switching modes never doubles the sensor
+    # reads (LibreHardwareMonitor's CPU temp in particular is not free).
+    statsUpdated = pyqtSignal(dict)
+
     def __init__(self):
         super().__init__()
+        self._latest_stats = {}
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(10)
@@ -1465,8 +1609,14 @@ class SystemTab(QWidget):
         self.timer.start(1000)
         self.update_stats()
 
+    def latest_stats(self):
+        """The most recent poll, for a view that has just been shown and
+        would otherwise sit blank until the next tick."""
+        return dict(self._latest_stats)
+
     def update_stats(self):
-        self.cpu_gauge.set_usage(psutil.cpu_percent())
+        cpu_usage = psutil.cpu_percent()
+        self.cpu_gauge.set_usage(cpu_usage)
 
         vm = psutil.virtual_memory()
         self.ram_gauge.set_usage(vm.percent)
@@ -1484,15 +1634,276 @@ class SystemTab(QWidget):
         ram_temp = get_ram_temp()
         self.ram_gauge.set_temp_text(f"{ram_temp} °C" if ram_temp is not None else "N/A")
 
+        gpu_usage = 0
         if NVML_AVAILABLE:
             try:
                 handle = pynvml.nvmlDeviceGetHandleByIndex(0)
                 util = pynvml.nvmlDeviceGetUtilizationRates(handle)
-                self.gpu_gauge.set_usage(util.gpu)
+                gpu_usage = util.gpu
             except Exception:
-                pass
+                # A single failed read shouldn't slam the gauge to zero - keep
+                # showing the last good figure until the next poll succeeds.
+                gpu_usage = self._latest_stats.get("gpu_usage", 0)
+        self.gpu_gauge.set_usage(gpu_usage)
+
+        self._latest_stats = {
+            "cpu_usage": cpu_usage,
+            "cpu_temp": cpu_temp,
+            "ram_used_gb": used_gb,
+            "ram_total_gb": total_gb,
+            "ram_percent": vm.percent,
+            "gpu_usage": gpu_usage,
+            "gpu_temp": gpu_temp,
+        }
+        self.statsUpdated.emit(self._latest_stats)
+
+
+# ---------------------------------------------------------------------------
+# Staying on top
+#
+# Qt's WindowStaysOnTopHint sets the WS_EX_TOPMOST style when the native
+# window is created, and that is the whole of what it does. It is enough for
+# ordinary desktop windows, but "topmost" is a band, not a ranking: every
+# topmost window shares one band, and whichever was activated last sits at
+# the front of it. A borderless game, another overlay, or anything else
+# flagged topmost will therefore end up covering us as soon as it is clicked.
+#
+# So the flag on its own is only half the job. _reassert_topmost() below
+# re-issues the SetWindowPos call, which moves the window back to the front
+# of that band. It passes SWP_NOACTIVATE, so it never steals focus - the
+# window resurfaces without the game underneath losing input.
+#
+# Two things this deliberately does not try to fix:
+#   - A game in true exclusive fullscreen. There the GPU scans the game's own
+#     buffer straight out to the display and the desktop compositor is
+#     bypassed, so no window z-order is consulted at all. Borderless or
+#     windowed mode is what makes any overlay possible, and that is the
+#     game's setting, not ours.
+#   - Another process pinning *our* window. DeskDeck runs elevated (see
+#     ensure_elevated()), and Windows' UIPI blocks a normal-privilege process
+#     from calling SetWindowPos on a higher-privilege window - which is why
+#     PowerToys' Always on Top silently does nothing to this app unless it is
+#     also run as administrator. A process setting its own window topmost
+#     crosses no privilege boundary, so doing it in here always works.
+# ---------------------------------------------------------------------------
+
+HWND_TOPMOST = -1
+HWND_NOTOPMOST = -2
+SWP_NOSIZE = 0x0001
+SWP_NOMOVE = 0x0002
+SWP_NOACTIVATE = 0x0010
+
+try:
+    _user32 = ctypes.windll.user32
+    # Without explicit argtypes ctypes would pass the window handles as 32-bit
+    # ints, truncating them on 64-bit Windows.
+    _user32.SetWindowPos.argtypes = [
+        wintypes.HWND, wintypes.HWND,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        ctypes.c_uint,
+    ]
+    _user32.SetWindowPos.restype = wintypes.BOOL
+except Exception:
+    _user32 = None
+
+
+def apply_topmost(widget, enabled):
+    """Move widget's native window into (or out of) the topmost band without
+    activating it. Safe to call repeatedly - re-asserting a window that is
+    already topmost and in front is invisible to the user."""
+    if _user32 is None:
+        return
+    try:
+        hwnd = int(widget.winId())
+    except Exception:
+        return
+    if not hwnd:
+        return
+    _user32.SetWindowPos(
+        ctypes.c_void_p(hwnd),
+        ctypes.c_void_p(HWND_TOPMOST if enabled else HWND_NOTOPMOST),
+        0, 0, 0, 0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Overlay mode
+# ---------------------------------------------------------------------------
+
+class OverlayWindow(QWidget):
+    """The stripped-down view: no frame, no title bar, no gauges, no mixer -
+    just the figures worth glancing at mid-game, and an X on the first row to
+    put it away. Each line is
+    [name] [usage%] [temperature], which keeps it to three rows instead of
+    five; RAM has no usage column because its used/total already is one.
+
+    It is a separate top-level window rather than another page inside the main
+    one so that neither has to compromise: the main window keeps its frame,
+    its minimum size and its own always-on-top setting, while this one is
+    frameless, small, permanently topmost and kept out of the taskbar
+    (Qt.Tool). Deliberately parentless - a Qt.Tool window with a parent is
+    hidden whenever that parent hides, and the main window stays hidden for
+    as long as this is up.
+
+    Frameless also means there is no title bar to drag it by, so the whole
+    widget acts as the drag handle (see mousePressEvent below). That is only
+    possible because the background is painted at alpha 0.02 rather than 0 -
+    see the OverlayCard rule in STYLE_SHEET for why."""
+
+    backRequested = pyqtSignal()
+
+    # Width of the close glyph, and so also the width every other row
+    # reserves on its right to keep the value column aligned.
+    CLOSE_SIZE = 18
+
+    # Height of every row. Deliberately tighter than the labels' natural line
+    # box - at 11pt that box is 20px around ~15px of ink, and three of them
+    # stacked leaves gaps that read as spacing nobody asked for. Nothing in
+    # the readout has a descender ("42 C", "7.8 / 15.9 GB"), so the ink fits.
+    ROW_HEIGHT = 15
+
+    def __init__(self):
+        super().__init__(
+            None,
+            Qt.WindowType.Tool
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint,
+        )
+        self.setObjectName("OverlayRoot")
+        self.setWindowTitle("DeskDeck")
+        self.setWindowIcon(build_app_icon())
+        # OverlayCard paints no background, so this is what actually lets
+        # the game through - without it the window would be a black slab.
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self._drag_offset = None
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        card = QFrame()
+        card.setObjectName("OverlayCard")
+        outer.addWidget(card)
+
+        body = QVBoxLayout(card)
+        body.setContentsMargins(10, 5, 10, 5)
+        # No gap between the rows - each one is already a full line box taller
+        # than its glyphs, which is separation enough, and in overlay mode the
+        # slab wants to be as short as it can get.
+        body.setSpacing(0)
+
+        # The close glyph rides on the CPU row rather than taking a row of its
+        # own - in overlay mode every row of height is one the game doesn't
+        # get. The rows below reserve the same width on their right (the
+        # gutter in _add_row), so the temperatures stay in one column instead
+        # of the CPU one sitting proud of the other two.
+        close = QPushButton("\u2715")
+        close.setObjectName("OverlayClose")
+        close.setCursor(Qt.CursorShape.PointingHandCursor)
+        close.setToolTip("Back to the full DeskDeck window")
+        close.setFixedSize(self.CLOSE_SIZE, self.ROW_HEIGHT)
+        close.clicked.connect(self.backRequested.emit)
+
+        self.cpu_usage, self.cpu_value = self._add_row(
+            body, "CPU", usage=True, trailing=close)
+        _, self.ram_value = self._add_row(body, "RAM")
+        self.gpu_usage, self.gpu_value = self._add_row(body, "GPU", usage=True)
+
+        # Fixed width so the readout doesn't twitch sideways every time a
+        # value gains or loses a digit. Sized so the widest realistic row
+        # ("100%  100 °C" / "128.0 / 128.0 GB") still fits without clipping.
+        self.setFixedWidth(216)
+        self.adjustSize()
+
+    def _add_row(self, layout, name, usage=False, trailing=None):
+        """One line: [name] .... [usage%] [value] [gutter], the right-hand
+        items packed against the right edge so the temperatures line up down
+        the column. Returns (usage_label, value_label); usage_label is None
+        when the row has no usage column, which is the RAM row - "9.1 / 15.9
+        GB" is already a usage figure and a percentage beside it would just be
+        noise.
+
+        The gutter is `trailing` on the one row that carries the close glyph
+        and an equal-width blank everywhere else; without that blank the rows
+        below would run CLOSE_SIZE further right than the CPU row."""
+        row = QHBoxLayout()
+        row.setSpacing(10)
+
+        label = QLabel(name)
+        label.setObjectName("OverlayLabel")
+        label.setFixedHeight(self.ROW_HEIGHT)
+        row.addWidget(label)
+        row.addStretch()
+
+        usage_label = None
+        if usage:
+            usage_label = QLabel("--")
+            usage_label.setObjectName("OverlayUsage")
+            usage_label.setAlignment(
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            usage_label.setFixedHeight(self.ROW_HEIGHT)
+            row.addWidget(usage_label)
+
+        value = QLabel("--")
+        value.setObjectName("OverlayValue")
+        value.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        value.setFixedHeight(self.ROW_HEIGHT)
+        row.addWidget(value)
+
+        if trailing is None:
+            # An empty stand-in rather than addSpacing(): a spacer item does
+            # not pick up the layout's inter-item spacing the way a widget
+            # does, which would leave these rows' values sitting 10px right
+            # of the CPU row's.
+            trailing = QWidget()
+            trailing.setObjectName("OverlayGutter")
+            trailing.setFixedSize(self.CLOSE_SIZE, self.ROW_HEIGHT)
+        row.addWidget(trailing)
+
+        layout.addLayout(row)
+        return usage_label, value
+
+    @staticmethod
+    def _percent(value):
+        return f"{value:.0f}%" if value is not None else "--"
+
+    def update_stats(self, stats):
+        if not stats:
+            return
+        cpu_temp = stats.get("cpu_temp")
+        gpu_temp = stats.get("gpu_temp")
+        self.cpu_value.setText(f"{cpu_temp} °C" if cpu_temp is not None else "N/A")
+        self.gpu_value.setText(f"{gpu_temp} °C" if gpu_temp is not None else "N/A")
+        self.cpu_usage.setText(self._percent(stats.get("cpu_usage")))
+        self.gpu_usage.setText(self._percent(stats.get("gpu_usage")))
+        used = stats.get("ram_used_gb")
+        total = stats.get("ram_total_gb")
+        if used is None or total is None:
+            self.ram_value.setText("N/A")
         else:
-            self.gpu_gauge.set_usage(0)
+            self.ram_value.setText(f"{used:.1f} / {total:.1f} GB")
+
+    # -- dragging, since there is no title bar to grab ---------------------
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_offset = (
+                event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            )
+            event.accept()
+
+    def mouseMoveEvent(self, event):
+        if self._drag_offset is not None and (event.buttons() & Qt.MouseButton.LeftButton):
+            self.move(event.globalPosition().toPoint() - self._drag_offset)
+            event.accept()
+
+    def mouseReleaseEvent(self, event):
+        self._drag_offset = None
+
+    def closeEvent(self, event):
+        # There is no X to click, but Alt+F4 still lands here - treat it as
+        # "Back" so the app can't end up running with no window at all.
+        event.ignore()
+        self.backRequested.emit()
 
 
 # ---------------------------------------------------------------------------
@@ -1505,9 +1916,20 @@ class ControlCenter(QMainWindow):
         self.setWindowTitle("DeskDeck")
         self.setWindowIcon(build_app_icon())
         self.resize(700, 700)
-        self.setMinimumSize(560, 560)
+        # The height floor is low so collapsing the mixer can shrink the window
+        # right down to the system monitor; the mixer's own scroll area keeps
+        # its rows reachable at small heights.
+        self.setMinimumSize(560, 340)
+        self._expanded_height = 700
 
         self._saved_state = load_app_state()
+
+        # Overlay mode bookkeeping - set up before the widgets below, whose
+        # handlers (_sync_topmost in particular) already consult it.
+        self.overlay = None
+        self._overlay_mode = False
+        self._overlay_placed = False
+
         geometry_hex = self._saved_state.get("geometry_hex")
         if geometry_hex:
             try:
@@ -1527,6 +1949,9 @@ class ControlCenter(QMainWindow):
         title.setObjectName("AppTitle")
 
         subtitle_row = QHBoxLayout()
+        # Explicit gap: the two checkboxes and the Overlay button otherwise
+        # sit shoulder to shoulder with no space between their labels.
+        subtitle_row.setSpacing(14)
         subtitle = QLabel("Live system stats & per-app audio control")
         subtitle.setObjectName("AppSubtitle")
         subtitle_row.addWidget(subtitle)
@@ -1542,12 +1967,27 @@ class ControlCenter(QMainWindow):
         self.always_on_top_checkbox.stateChanged.connect(self.toggle_always_on_top)
         subtitle_row.addWidget(self.always_on_top_checkbox)
 
+        # The window flag alone only gets us into the topmost band; staying at
+        # the front of it needs re-asserting. See apply_topmost() above.
+        self._topmost_timer = QTimer(self)
+        self._topmost_timer.setInterval(2000)
+        self._topmost_timer.timeout.connect(self._reassert_topmost)
+
         self.startup_checkbox = QCheckBox("Start with Windows")
         self.startup_checkbox.setToolTip("Launch DeskDeck automatically when you sign in")
         self.startup_checkbox.setCursor(Qt.CursorShape.PointingHandCursor)
         self.startup_checkbox.setChecked(is_startup_enabled())
         self.startup_checkbox.stateChanged.connect(self.toggle_startup)
         subtitle_row.addWidget(self.startup_checkbox)
+
+        self.overlay_button = QPushButton("Overlay")
+        self.overlay_button.setToolTip(
+            "Shrink to a small frameless readout - CPU temp, RAM and GPU temp "
+            "only - that stays on top of everything else"
+        )
+        self.overlay_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.overlay_button.clicked.connect(self.enter_overlay_mode)
+        subtitle_row.addWidget(self.overlay_button)
 
         # One-time setup so startup (and every other launch) doesn't show a
         # UAC prompt, and CPU temp works - the in-app alternative to
@@ -1572,8 +2012,8 @@ class ControlCenter(QMainWindow):
         add_shadow(system_panel, blur=28, alpha=100, y_offset=6)
         system_panel_layout = QVBoxLayout(system_panel)
         system_panel_layout.setContentsMargins(16, 16, 16, 16)
-        system_tab = SystemTab()
-        system_panel_layout.addWidget(system_tab)
+        self.system_tab = SystemTab()
+        system_panel_layout.addWidget(self.system_tab)
         layout.addWidget(system_panel, 0)
 
         mixer_panel = QFrame()
@@ -1581,14 +2021,42 @@ class ControlCenter(QMainWindow):
         add_shadow(mixer_panel, blur=28, alpha=100, y_offset=6)
         mixer_panel_layout = QVBoxLayout(mixer_panel)
         mixer_panel_layout.setContentsMargins(16, 16, 16, 16)
-        mixer_tab = MixerTab()
-        mixer_panel_layout.addWidget(mixer_tab)
+        self.mixer_tab = MixerTab(collapsed=self._saved_state.get("mixer_collapsed", False))
+        self.mixer_tab.collapsedChanged.connect(self._on_mixer_collapsed)
+        mixer_panel_layout.addWidget(self.mixer_tab)
         layout.addWidget(mixer_panel, 0)
         layout.addStretch()
 
         self.setCentralWidget(central)
 
         self._setup_tray()
+
+    def _on_mixer_collapsed(self, collapsed):
+        """Collapsing the mixer should actually give the space back, not leave
+        an empty gap - so pull the window down to just the system monitor, and
+        hand the height back when the mixer returns."""
+        if collapsed:
+            self._expanded_height = self.height()
+
+        central = self.centralWidget()
+        # Recompute the layouts from the mixer outwards before measuring:
+        # straight after hiding the mixer body they still report the old,
+        # taller size hints, and Qt only refreshes them a few events later.
+        widget = self.mixer_tab
+        while widget is not None:
+            if widget.layout() is not None:
+                widget.layout().activate()
+            if widget is central:
+                break
+            widget = widget.parentWidget()
+
+        chrome = self.height() - central.height()  # title bar, frame, etc.
+        target = chrome + central.sizeHint().height()
+        if not collapsed:
+            # Come back to the height the window had before it was collapsed,
+            # unless the content now needs more than that.
+            target = max(self._expanded_height, target)
+        self.resize(self.width(), target)
 
     def toggle_startup(self, state):
         set_startup_enabled(bool(state))
@@ -1618,9 +2086,99 @@ class ControlCenter(QMainWindow):
                 "an admin prompt on each launch and no CPU temperature.",
             )
 
+    def start(self):
+        """First appearance - straight into whichever mode the app was left in
+        last time."""
+        if self._saved_state.get("overlay_mode", False):
+            self.enter_overlay_mode()
+        else:
+            self.show()
+            self._sync_topmost()
+
     def toggle_always_on_top(self, state):
-        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, bool(state))
-        self.show()  # changing window flags requires re-showing to take effect
+        enabled = bool(state)
+        visible = self.isVisible()
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, enabled)
+        if visible:
+            # Changing window flags destroys and recreates the native window,
+            # so it has to be re-shown - but only if it was on screen already,
+            # or this would yank the app back out of the tray.
+            self.show()
+        self._sync_topmost()
+
+    def _sync_topmost(self):
+        """Run the re-assert timer only while something actually needs to stay
+        in front: the main window with 'Always on top' ticked, or the overlay,
+        which is on top by definition."""
+        if self._overlay_mode or self.always_on_top_checkbox.isChecked():
+            self._reassert_topmost()
+            self._topmost_timer.start()
+        else:
+            self._topmost_timer.stop()
+            apply_topmost(self, False)
+
+    def _reassert_topmost(self):
+        target = self.overlay if self._overlay_mode else self
+        if target is None or not target.isVisible() or target.isMinimized():
+            return
+        apply_topmost(target, True)
+
+    # -- overlay mode ------------------------------------------------------
+
+    def enter_overlay_mode(self):
+        """Put the full window away and leave just the small readout up."""
+        if self._overlay_mode:
+            return
+
+        if self.overlay is None:
+            self.overlay = OverlayWindow()
+            self.overlay.backRequested.connect(self.exit_overlay_mode)
+            # Piggy-back on the system tab's existing poll rather than starting
+            # a second set of sensor reads.
+            self.system_tab.statsUpdated.connect(self.overlay.update_stats)
+
+        if not self._overlay_placed:
+            self._place_overlay()
+            self._overlay_placed = True
+
+        self._overlay_mode = True
+        self._persist_state()  # remember where the full window was sitting
+        self.hide()
+        self.mixer_tab.set_polling_enabled(False)
+        # Show the last poll straight away instead of "--" for up to a second.
+        self.overlay.update_stats(self.system_tab.latest_stats())
+        self.overlay.show()
+        self._sync_topmost()
+
+    def exit_overlay_mode(self):
+        if not self._overlay_mode:
+            return
+        self._overlay_mode = False
+        if self.overlay is not None:
+            self.overlay.hide()
+        self.mixer_tab.set_polling_enabled(True)
+        self.showNormal()
+        self.activateWindow()
+        self.raise_()
+        self._sync_topmost()
+        self._persist_state()
+
+    def _place_overlay(self):
+        """Back where it was left, or tucked into the top-right corner of the
+        primary screen the first time round."""
+        geometry_hex = self._saved_state.get("overlay_geometry_hex")
+        if geometry_hex:
+            try:
+                if self.overlay.restoreGeometry(bytes.fromhex(geometry_hex)):
+                    return
+            except Exception:
+                pass
+        screen = QApplication.primaryScreen()
+        if screen is None:
+            return
+        area = screen.availableGeometry()
+        self.overlay.adjustSize()
+        self.overlay.move(area.right() - self.overlay.width() - 24, area.top() + 24)
 
     def _setup_tray(self):
         self.tray_icon = QSystemTrayIcon(build_app_icon(), self)
@@ -1629,6 +2187,8 @@ class ControlCenter(QMainWindow):
         tray_menu = QMenu()
         show_action = tray_menu.addAction("Show DeskDeck")
         show_action.triggered.connect(self.show_and_raise)
+        overlay_action = tray_menu.addAction("Overlay mode")
+        overlay_action.triggered.connect(self.enter_overlay_mode)
         tray_menu.addSeparator()
         quit_action = tray_menu.addAction("Quit")
         quit_action.triggered.connect(self._quit)
@@ -1645,18 +2205,36 @@ class ControlCenter(QMainWindow):
             self.show_and_raise()
 
     def show_and_raise(self):
+        if self._overlay_mode:
+            # The tray icon is the way back if the overlay ever ends up
+            # somewhere awkward, so treat "Show DeskDeck" as Back.
+            self.exit_overlay_mode()
+            return
         self.showNormal()
         self.activateWindow()
         self.raise_()
 
     def _persist_state(self):
-        save_app_state({
+        state = {
             "geometry_hex": bytes(self.saveGeometry()).hex(),
             "always_on_top": self.always_on_top_checkbox.isChecked(),
-        })
+            "mixer_collapsed": self.mixer_tab.collapsed,
+            "overlay_mode": self._overlay_mode,
+        }
+        # saveGeometry() still reports the last real placement after a window
+        # is hidden, so this is correct whichever mode we are in.
+        overlay_geometry_hex = (
+            bytes(self.overlay.saveGeometry()).hex() if self.overlay is not None
+            else self._saved_state.get("overlay_geometry_hex")
+        )
+        if overlay_geometry_hex:
+            state["overlay_geometry_hex"] = overlay_geometry_hex
+        save_app_state(state)
 
     def _quit(self):
         self._persist_state()
+        if self.overlay is not None:
+            self.overlay.hide()
         QApplication.instance().quit()
 
     def closeEvent(self, event):
@@ -1682,7 +2260,7 @@ def main():
     app.setStyleSheet(STYLE_SHEET)
     app.setQuitOnLastWindowClosed(False)  # closing to tray shouldn't end the app
     window = ControlCenter()
-    window.show()
+    window.start()
     sys.exit(app.exec())
 
 

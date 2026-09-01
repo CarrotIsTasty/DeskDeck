@@ -32,7 +32,9 @@ Requires Python 3.9+ on Windows 10/11.
 1. Download [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor/releases) and copy `LibreHardwareMonitorLib.dll` (plus any DLLs sitting next to it in the release zip, e.g. `HidSharp.dll`) into a `libs` folder next to `main.py`.
 2. Right-click `setup_admin_task.bat` → **Run as administrator**, and follow the prompt. This registers a Scheduled Task that lets the app elevate itself **without a UAC prompt on every future launch** (see below for why this step exists and what it does).
 
-Skipping either step is fine — the rest of the app still runs, CPU temp just shows "N/A" (step 1 missing) or you'll get a UAC prompt every launch instead of none (step 2 skipped).
+**Important — project location:** this whole app must live in a plain local folder, **not inside a OneDrive-synced directory** (e.g. `Desktop`/`Documents` with Known Folder Move enabled counts as synced). `pythonnet`/`clr` loading `LibreHardwareMonitorLib.dll` is blocked by .NET's security model when the folder is treated as a network location, which is how OneDrive sync paths are seen. If your Desktop has a cloud icon next to it in File Explorer's sidebar, move (not copy) this whole project folder somewhere local first, e.g. `C:\Dev\DeskDeck`.
+
+Skipping steps 1–2 is fine — the rest of the app still runs, CPU temp just shows "N/A" (step 1 missing) or you'll get a UAC prompt every launch instead of none (step 2 skipped).
 
 ## About the temperature readings
 
