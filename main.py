@@ -60,7 +60,7 @@ try:
         QProgressBar, QCheckBox, QGraphicsDropShadowEffect, QSizePolicy,
         QSystemTrayIcon, QMenu, QMessageBox
     )
-    from PyQt6.QtCore import Qt, QTimer, QRectF, pyqtSignal
+    from PyQt6.QtCore import Qt, QTimer, QRectF, QEvent, pyqtSignal
     from PyQt6.QtGui import (
         QPainter, QPen, QColor, QFont, QConicalGradient, QFontMetrics,
         QIcon, QPixmap
@@ -1822,6 +1822,9 @@ class OverlayWindow(QWidget):
     lock it again. See set_click_through()."""
 
     backRequested = pyqtSignal()
+    # Emitted when a drag finishes, so the window that owns the lock can put
+    # it back on rather than leaving the overlay clickable forever.
+    moveFinished = pyqtSignal()
 
     # Width of the close glyph, and so also the width every other row
     # reserves on its right to keep the value column aligned.
@@ -1996,7 +1999,10 @@ class OverlayWindow(QWidget):
             event.accept()
 
     def mouseReleaseEvent(self, event):
+        dragged = self._drag_offset is not None
         self._drag_offset = None
+        if dragged:
+            self.moveFinished.emit()
 
     def closeEvent(self, event):
         # There is no X to click, but Alt+F4 still lands here - treat it as
@@ -2010,6 +2016,10 @@ class OverlayWindow(QWidget):
 # ---------------------------------------------------------------------------
 
 class ControlCenter(QMainWindow):
+    # How long the overlay stays clickable after a drag before locking itself
+    # again. See _relock_overlay().
+    RELOCK_DELAY_MS = 5000
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("DeskDeck")
@@ -2028,11 +2038,21 @@ class ControlCenter(QMainWindow):
         self.overlay = None
         self._overlay_mode = False
         self._overlay_placed = False
-        # Locked by default: an overlay you can click is an overlay that eats
-        # a shot the first time you happen to aim through it.
-        self._overlay_click_through = bool(
-            self._saved_state.get("overlay_click_through", True))
+        # Always locked at startup, deliberately not restored from disk.
+        # Unlocking is how you move the overlay, so it is a mode you are in
+        # for the few seconds that takes - and an unlock that outlived the
+        # session it was made in is exactly how the click-eating bug came
+        # back: the overlay was left clickable, and the next game found it.
+        self._overlay_click_through = True
         self._overlay_hint_shown = False
+        # Qt.Tool is what actually drops the taskbar button: Windows gives one
+        # to ordinary top-level windows, and a tool window is not one. Set
+        # here rather than in _setup_tray so it is on the window before it is
+        # ever shown - the taskbar only looks once, at creation.
+        self._hide_from_taskbar = bool(
+            self._saved_state.get("hide_from_taskbar", False))
+        if self._hide_from_taskbar:
+            self.setWindowFlag(Qt.WindowType.Tool, True)
 
         geometry_hex = self._saved_state.get("geometry_hex")
         if geometry_hex:
@@ -2076,6 +2096,13 @@ class ControlCenter(QMainWindow):
         self._topmost_timer = QTimer(self)
         self._topmost_timer.setInterval(2000)
         self._topmost_timer.timeout.connect(self._reassert_topmost)
+
+        # Long enough to reposition the overlay a second time without fighting
+        # the timer, short enough that you cannot walk away leaving it armed.
+        self._relock_timer = QTimer(self)
+        self._relock_timer.setInterval(self.RELOCK_DELAY_MS)
+        self._relock_timer.setSingleShot(True)
+        self._relock_timer.timeout.connect(self._relock_overlay)
 
         self.startup_checkbox = QCheckBox("Start with Windows")
         self.startup_checkbox.setToolTip("Launch DeskDeck automatically when you sign in")
@@ -2130,8 +2157,14 @@ class ControlCenter(QMainWindow):
         self.mixer_tab = MixerTab(collapsed=self._saved_state.get("mixer_collapsed", False))
         self.mixer_tab.collapsedChanged.connect(self._on_mixer_collapsed)
         mixer_panel_layout.addWidget(self.mixer_tab)
-        layout.addWidget(mixer_panel, 0)
-        layout.addStretch()
+
+        # The monitor is a fixed row of three gauges and takes its size hint;
+        # the mixer is the panel whose contents actually vary, so it is the one
+        # that stretches. With no trailing stretch below it, every pixel the
+        # window gains or loses is a pixel of mixer - drag the window's bottom
+        # edge and the mixer box grows or shrinks with it, and nothing else
+        # moves.
+        layout.addWidget(mixer_panel, 1)
 
         self.setCentralWidget(central)
 
@@ -2212,6 +2245,26 @@ class ControlCenter(QMainWindow):
             self.show()
         self._sync_topmost()
 
+    def toggle_hide_from_taskbar(self, enabled):
+        """Tray menu: drop the taskbar button, or put it back.
+
+        The taskbar only looks at a window when it is created, so the flag
+        change - which recreates it anyway - has to be followed by a fresh
+        show() for the taskbar to notice."""
+        enabled = bool(enabled)
+        if enabled == self._hide_from_taskbar:
+            return
+        self._hide_from_taskbar = enabled
+        visible = self.isVisible()
+        self.setWindowFlag(Qt.WindowType.Tool, enabled)
+        if visible:
+            # Same reasoning as toggle_always_on_top: re-show only if it was
+            # on screen already, or this would drag the app out of the tray.
+            self.show()
+        # Recreating the native window drops the topmost style with it.
+        self._sync_topmost()
+        self._persist_state()
+
     def _sync_topmost(self):
         """Run the re-assert timer only while something actually needs to stay
         in front: the main window with 'Always on top' ticked, or the overlay,
@@ -2239,6 +2292,7 @@ class ControlCenter(QMainWindow):
         if self.overlay is None:
             self.overlay = OverlayWindow()
             self.overlay.backRequested.connect(self.exit_overlay_mode)
+            self.overlay.moveFinished.connect(self._arm_relock)
             # Piggy-back on the system tab's existing poll rather than starting
             # a second set of sensor reads.
             self.system_tab.statsUpdated.connect(self.overlay.update_stats)
@@ -2277,19 +2331,54 @@ class ControlCenter(QMainWindow):
 
     def set_overlay_click_through(self, enabled):
         """Tray menu: lock the overlay out of the mouse's way, or hand it back
-        so it can be dragged somewhere else."""
-        self._overlay_click_through = bool(enabled)
+        so it can be dragged somewhere else.
+
+        Idempotent, because _relock_overlay() ticks the tray action back on
+        and that re-enters here through the toggled signal."""
+        enabled = bool(enabled)
+        if enabled == self._overlay_click_through:
+            return
+        self._overlay_click_through = enabled
         if self.overlay is not None:
             self.overlay.set_click_through(self._overlay_click_through)
-        self._persist_state()
+        # Whichever way this was reached - tray tick or the re-lock timer -
+        # the menu has to show the state the overlay is actually in.
+        action = getattr(self, "overlay_lock_action", None)
+        if action is not None and action.isChecked() != enabled:
+            action.setChecked(enabled)
         if self._overlay_click_through:
+            self._relock_timer.stop()
             self._overlay_hint_shown = False
             self._hint_click_through()
         elif self._overlay_mode:
             self.tray_icon.showMessage(
                 "Overlay unlocked",
-                "Drag it anywhere, or click the X to come back. Clicks land "
-                "on the overlay again until you lock it.",
+                "Drag it where you want it - it locks itself again "
+                f"{self.RELOCK_DELAY_MS // 1000} seconds after you let go, or "
+                "click the X to come back.",
+                QSystemTrayIcon.MessageIcon.Information,
+                4000,
+            )
+
+    def _arm_relock(self):
+        """A drag has just finished. Start the countdown that puts the lock
+        back on, restarting it if the overlay is dragged again."""
+        if self._overlay_click_through:
+            return
+        self._relock_timer.start()
+
+    def _relock_overlay(self):
+        """Unlocking is for moving the overlay, and the move is over. Leaving
+        it clickable is what puts a click-eating window back over the game."""
+        if self._overlay_click_through:
+            return
+        self.set_overlay_click_through(True)
+        self._persist_state()
+        if self._overlay_mode:
+            self.tray_icon.showMessage(
+                "Overlay locked again",
+                "Clicks pass straight through it. Unlock it from this tray "
+                "icon whenever you want to move it.",
                 QSystemTrayIcon.MessageIcon.Information,
                 4000,
             )
@@ -2340,6 +2429,16 @@ class ControlCenter(QMainWindow):
         lock_action.setChecked(self._overlay_click_through)
         lock_action.toggled.connect(self.set_overlay_click_through)
         self.overlay_lock_action = lock_action
+        taskbar_action = tray_menu.addAction("Hide from taskbar")
+        taskbar_action.setCheckable(True)
+        taskbar_action.setToolTip(
+            "Keep DeskDeck out of the taskbar - and out of Alt+Tab and the "
+            "Windows snap layout picker with it. This icon becomes the only "
+            "way back to the window."
+        )
+        taskbar_action.setChecked(self._hide_from_taskbar)
+        taskbar_action.toggled.connect(self.toggle_hide_from_taskbar)
+        self.hide_from_taskbar_action = taskbar_action
         tray_menu.addSeparator()
         quit_action = tray_menu.addAction("Quit")
         quit_action.triggered.connect(self._quit)
@@ -2369,9 +2468,9 @@ class ControlCenter(QMainWindow):
         state = {
             "geometry_hex": bytes(self.saveGeometry()).hex(),
             "always_on_top": self.always_on_top_checkbox.isChecked(),
+            "hide_from_taskbar": self._hide_from_taskbar,
             "mixer_collapsed": self.mixer_tab.collapsed,
             "overlay_mode": self._overlay_mode,
-            "overlay_click_through": self._overlay_click_through,
         }
         # saveGeometry() still reports the last real placement after a window
         # is hidden, so this is correct whichever mode we are in.
@@ -2388,6 +2487,18 @@ class ControlCenter(QMainWindow):
         if self.overlay is not None:
             self.overlay.hide()
         QApplication.instance().quit()
+
+    def changeEvent(self, event):
+        """With no taskbar button there is nothing to click to bring a
+        minimised window back, so minimising goes to the tray instead - the
+        same place closing it already goes. The minimised state is left set
+        and cleared by show_and_raise()'s showNormal(), which avoids the
+        window flashing back up on its way to being hidden."""
+        super().changeEvent(event)
+        if (event.type() == QEvent.Type.WindowStateChange
+                and self._hide_from_taskbar and self.isMinimized()
+                and self.isVisible()):
+            QTimer.singleShot(0, self.hide)
 
     def closeEvent(self, event):
         # Closing the window just tucks the app into the tray - it keeps
