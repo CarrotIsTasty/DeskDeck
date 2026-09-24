@@ -1,5 +1,5 @@
 """
-DeskDeck
+DeskDeck Prototype
 --------------------
 A prototype Windows control panel that lets you:
   - See every app currently playing audio and control its volume/mute individually,
